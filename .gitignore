@@ -1,0 +1,38 @@
+# Only reviewed project files are eligible for normal git add operations.
+# Local configuration, credentials, data, dist/, caches and environments stay local.
+/*
+!/.gitignore
+!/.gitattributes
+!/README.md
+!/INSTALL.md
+!/requirements.txt
+!/start
+!/actions.py
+!/app.py
+!/auth.py
+!/browser.py
+!/config_loader.py
+!/job_store.py
+!/job_worker.py
+!/manage_user.py
+!/move_downloads.py
+!/remote_copy.py
+!/styles.py
+!/uploads.py
+!/utils.py
+!/directories.example.json
+!/users.example.json
+!/remote_destinations.example.json
+!/external_sites.example.json
+!/move_downloads.example.json
+!/tests/
+/tests/*
+!/tests/test_remote_copy.py
+!/tools/
+/tools/*
+!/tools/install.py
+!/tools/build_release.py
+
+# Never include generated Python files, even within allowed directories.
+__pycache__/
+*.py[cod]
