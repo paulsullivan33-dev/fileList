@@ -1,0 +1,4 @@
+# requirements.txt
+flask>=3.0
+flask-wtf>=1.2        # for CSRF tokens
+werkzeug>=3.0

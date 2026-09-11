@@ -1,0 +1,7 @@
+[
+  {
+    "username": "paul",
+    "password": "<generate with manage_user.py; do not use plaintext>",
+    "groups": "file-managers"
+  }
+]

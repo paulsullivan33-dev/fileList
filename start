@@ -1,0 +1,26 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+cd "$(dirname "$0")"
+if [[ -z "${PYTHON_BIN:-}" && -x ".venv/bin/python" ]]; then
+    PYTHON_BIN=".venv/bin/python"
+else
+    PYTHON_BIN="${PYTHON_BIN:-python3}"
+fi
+
+worker_pid=""
+app_pid=""
+
+cleanup() {
+    [[ -n "$app_pid" ]] && kill "$app_pid" 2>/dev/null || true
+    [[ -n "$worker_pid" ]] && kill "$worker_pid" 2>/dev/null || true
+    wait 2>/dev/null || true
+}
+trap cleanup EXIT INT TERM
+
+"$PYTHON_BIN" job_worker.py &
+worker_pid=$!
+"$PYTHON_BIN" app.py &
+app_pid=$!
+
+wait -n "$worker_pid" "$app_pid"

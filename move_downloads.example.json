@@ -1,0 +1,8 @@
+{
+  "source_directory": "/srv/downloads/completed",
+  "downloaded_file": "downloaded.txt",
+  "destinations": {
+    "documents": "/srv/files/documents",
+    "media": "/srv/files/media"
+  }
+}

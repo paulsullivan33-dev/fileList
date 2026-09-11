@@ -1,0 +1,18 @@
+[
+  {
+    "id": "media-server",
+    "name": "Media server",
+    "host": "media-server",
+    "user": "paul",
+    "port": 22,
+    "path": "/srv/media/incoming",
+    "group": "file-managers"
+  },
+  {
+    "id": "backup-server",
+    "name": "Backup server",
+    "host": "backup-server",
+    "path": "/srv/backups/files",
+    "group": "file-managers"
+  }
+]
