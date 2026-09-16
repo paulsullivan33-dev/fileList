@@ -2,9 +2,38 @@ import os
 import json
 import html
 import urllib.parse
+import shutil
 
 IMAGE_EXT = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".svg"}
 ARCHIVE_EXT = {".zip", ".tar", ".gz", ".tgz", ".7z"}
+
+
+def configured_bytes(name, default):
+    """Read a non-negative byte setting without making a bad setting fatal."""
+    try:
+        return max(0, int(os.environ.get(name, default)))
+    except (TypeError, ValueError):
+        return default
+
+
+def minimum_free_bytes():
+    return configured_bytes("FILELIST_MIN_FREE_BYTES", 256 * 1024 * 1024)
+
+
+def remote_minimum_free_bytes():
+    return configured_bytes("FILELIST_REMOTE_MIN_FREE_BYTES", minimum_free_bytes())
+
+
+def ensure_free_space(directory, required_bytes, reserve_bytes=None):
+    """Fail before an operation consumes space needed by the application."""
+    required = max(0, int(required_bytes))
+    reserve = minimum_free_bytes() if reserve_bytes is None else max(0, int(reserve_bytes))
+    free = shutil.disk_usage(directory).free
+    if free < required + reserve:
+        raise OSError(
+            f"Not enough free disk space: need {format_size(required + reserve)}, "
+            f"but only {format_size(free)} is available."
+        )
 
 
 # -------------------------------------------------------------------

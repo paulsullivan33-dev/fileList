@@ -86,6 +86,17 @@ Run the regression suite after installing dependencies:
 SSH commands are simulated in these tests; verify real remote connectivity on
 each deployment server.
 
+Validate the installed configuration before starting the service or after a
+server change:
+
+```bash
+.venv/bin/python tools/check_config.py
+```
+
+Add `--ssh` to verify each configured remote destination with the same account
+that runs fileList. It checks passwordless SSH, remote-directory write access,
+and remote `rsync` availability without copying files.
+
 A multi-directory, browser-based file manager built with Flask. Manage your files with a clean UI featuring dark mode, archive handling, file previews, and robust path validation — all from a lightweight Python web server.
 
 ## Users and sign-in
@@ -194,6 +205,13 @@ JOB_DATA_DIR=/home/filelist/.local/state/filelist/jobs
 JOB_MAX_PENDING_PER_USER=20
 JOB_HISTORY_DAYS=7
 JOB_PROGRESS_INTERVAL=2
+FILELIST_MIN_FREE_BYTES=268435456
+FILELIST_REMOTE_MIN_FREE_BYTES=268435456
+ARCHIVE_MAX_MEMBERS=10000
+ARCHIVE_MAX_UNCOMPRESSED_BYTES=10737418240
+LOGIN_MAX_ATTEMPTS=5
+LOGIN_WINDOW_SECONDS=300
+LOGIN_LOCK_SECONDS=300
 FILELIST_CONFIG=/home/filelist/fileList/directories.json
 ```
 
@@ -201,6 +219,15 @@ Only one worker may use a job directory at a time. Copy and move jobs report
 byte progress, can be cancelled, survive browser navigation, and remain visible
 after Flask restarts. If the worker stops during a job, that job is marked
 failed on the next worker start and can be submitted again.
+
+Open **Recent transfers** from the directory header to review your queued,
+running, completed, failed, and cancelled jobs. Job history is private to the
+signed-in user and is removed according to `JOB_HISTORY_DAYS`.
+
+Archive extraction checks paths, links, entry count, total uncompressed size,
+and available space before writing files. Uploads, video conversion, and remote
+copy staging also reserve free space. The byte settings above show the defaults;
+raise them when the server needs a larger operating-space reserve.
 
 ## Copy to remote servers (Linux)
 
@@ -254,6 +281,8 @@ cancelled copies can leave staging directories;
 the job displays the partial path for manual cleanup. A worker crash can also
 leave staging directories. Previously completed items remain if a multi-item
 job fails or is cancelled. Source files should remain unchanged during copying.
+
+The Select All checkbox chooses only rows currently visible after filtering.
 
 Run the remote-copy regression checks with:
 

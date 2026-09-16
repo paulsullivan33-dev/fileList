@@ -115,6 +115,29 @@ def pending_count(owner=None):
     return count
 
 
+def history(owner, limit=50):
+    """Return an owner's newest durable jobs, including completed history."""
+    initialize()
+    try:
+        limit = max(1, min(int(limit), 200))
+    except (TypeError, ValueError):
+        limit = 50
+    records = []
+    for state in STATES:
+        for path in (job_root() / state).glob("*.json"):
+            try:
+                job = read_path(path)
+            except (OSError, json.JSONDecodeError):
+                continue
+            if job.get("owner") == owner:
+                records.append(job)
+    records.sort(
+        key=lambda job: job.get("finished_at") or job.get("started_at") or job.get("created_at") or "",
+        reverse=True,
+    )
+    return records[:limit]
+
+
 def has_active_destination(destination):
     initialize()
     for state in ("pending", "running"):

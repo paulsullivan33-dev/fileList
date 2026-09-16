@@ -7,7 +7,7 @@ import uuid
 from flask import request, jsonify, abort
 from werkzeug.utils import secure_filename
 
-from utils import is_safe_path, is_safe_segment, safe_join, safe_dir_index
+from utils import ensure_free_space, is_safe_path, is_safe_segment, safe_join, safe_dir_index
 
 
 # -----------------------------------------------------------------
@@ -126,6 +126,11 @@ def register(app, DIRECTORIES):
         if target_dir is None or not os.path.isdir(target_dir):
             return jsonify({"success": False,
                             "error": "Destination is not a directory."})
+
+        try:
+            ensure_free_space(target_dir, request.content_length or 0)
+        except OSError as error:
+            return jsonify({"success": False, "error": str(error)}), 507
 
         files = request.files.getlist("files")
         if not files:

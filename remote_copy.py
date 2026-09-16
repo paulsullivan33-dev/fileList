@@ -9,7 +9,7 @@ import tempfile
 import time
 from pathlib import Path
 
-from utils import is_safe_path, is_safe_segment, safe_dir_index, safe_join, user_can_access_directory
+from utils import is_safe_path, is_safe_segment, remote_minimum_free_bytes, safe_dir_index, safe_join, user_can_access_directory
 
 
 RSYNC_PROGRESS = re.compile(r"(?:^|[\r\n])\s*([0-9][0-9,]*)\s+\d+%")
@@ -259,6 +259,9 @@ def run_job(job, job_path, directories, progress_class, check_cancel):
         # is attempted on failure: interrupted work remains recognizable for cleanup.
         prepare = (
             f"test -d {quote(destination['path'])} && "
+            f"available=$(df -Pk -- {quote(destination['path'])} | awk 'NR == 2 {{print $4 * 1024}}') && "
+            f"test -n \"$available\" && test \"$available\" -ge {item_total + remote_minimum_free_bytes()} || "
+            "{ echo 'Not enough free disk space on remote destination' >&2; exit 1; } && "
             f"if test -e {quote(target)} || test -L {quote(target)}; then "
             "echo 'Destination already exists' >&2; exit 1; fi && "
             f"mkdir -- {quote(stage)}"

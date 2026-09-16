@@ -329,6 +329,7 @@ def register(app, DIRECTORIES):
             + f"<div class='header'>"
                f"<span style='color:white;'>Select Directory:</span> "
                f"{dir_tabs_html}"
+               f"<a class='header-link' href='/jobs'>Recent transfers</a>"
                f"<span class='dark-toggle' onclick='toggleDark()'>🌓 Theme</span>"
                f"<form class='logout-form' method='post' action='/logout'>"
                f"<input type='hidden' name='csrf_token' value='{generate_csrf()}'>"
@@ -586,7 +587,12 @@ function filterTable() {
 // Selection
 // -----------------------------------------------------------------
 function toggleAll(cb) {
-    document.querySelectorAll('.sel').forEach(x => x.checked = cb.checked);
+    document.querySelectorAll('#fileTable tbody tr').forEach(row => {
+        if (row.style.display !== 'none') {
+            const checkbox = row.querySelector('.sel');
+            if (checkbox) checkbox.checked = cb.checked;
+        }
+    });
 }
 
 function getSelected() {

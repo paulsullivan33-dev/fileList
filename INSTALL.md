@@ -109,7 +109,12 @@ Run checks after installation with:
 
 ```bash
 .venv/bin/python -m unittest discover -s tests -v
+.venv/bin/python tools/check_config.py
 ```
+
+Use `.venv/bin/python tools/check_config.py --ssh` after configuring remote
+destinations to verify SSH, remote write access, and rsync without transferring
+files.
 
 The same ZIP can be used on each Linux server. Configure each new server separately;
 upgrades preserve its settings. `--skip-dependencies` is available only when you

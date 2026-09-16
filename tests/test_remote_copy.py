@@ -138,6 +138,7 @@ class RemoteCopyTests(unittest.TestCase):
         self.assertEqual(commands[0][0], "ssh")
         self.assertIn("-oBatchMode=yes", commands[0])
         self.assertIn("-oStrictHostKeyChecking=yes", commands[0])
+        self.assertIn("df -Pk", commands[0][-1])
         self.assertIn("mkdir --", commands[0][-1])
         self.assertEqual(commands[1][0], "rsync")
         self.assertIn("--info=progress2", commands[1])

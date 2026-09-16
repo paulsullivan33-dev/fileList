@@ -17,12 +17,40 @@ import remote_copy
 from utils import (
     is_safe_path,
     is_safe_segment,
+    ensure_free_space,
+    format_size,
     safe_join,
     safe_dir_index,
     is_subpath,
     warn_and_redirect,
     user_can_access_directory,
 )
+
+
+ARCHIVE_MAX_MEMBERS = 10000
+ARCHIVE_MAX_UNCOMPRESSED_BYTES = 10 * 1024 * 1024 * 1024
+
+
+def _archive_limits():
+    try:
+        members = max(1, int(os.environ.get("ARCHIVE_MAX_MEMBERS", ARCHIVE_MAX_MEMBERS)))
+    except ValueError:
+        members = ARCHIVE_MAX_MEMBERS
+    try:
+        size = max(0, int(os.environ.get("ARCHIVE_MAX_UNCOMPRESSED_BYTES", ARCHIVE_MAX_UNCOMPRESSED_BYTES)))
+    except ValueError:
+        size = ARCHIVE_MAX_UNCOMPRESSED_BYTES
+    return members, size
+
+
+def _validate_archive_size(entries):
+    max_members, max_size = _archive_limits()
+    if len(entries) > max_members:
+        raise ValueError(f"Archive has too many entries (maximum {max_members}).")
+    total = sum(size for size in entries if size > 0)
+    if total > max_size:
+        raise ValueError(f"Archive expands to {format_size(total)}, above the {format_size(max_size)} limit.")
+    return total
 
 
 def _allowed_directory_indices(directories):
@@ -535,6 +563,10 @@ def register(app, DIRECTORIES):
             return {"success": False, "error": f"{output_name} already exists."}, 409
 
         try:
+            ensure_free_space(os.path.dirname(output), os.path.getsize(source))
+        except OSError as error:
+            return {"success": False, "error": str(error)}, 507
+        try:
             job = _enqueue_job(
                 "convert",
                 {"directory_index": dir_index, "path": path, "names": [name]},
@@ -548,6 +580,41 @@ def register(app, DIRECTORIES):
             "status": "pending",
             "output": output_name,
         }, 202
+
+    @app.route("/jobs", endpoint="job_history")
+    def job_history():
+        jobs = job_store.history(session.get("username"))
+        rows = []
+        for job in jobs:
+            source = job.get("source", {})
+            names = source.get("names", []) if isinstance(source, dict) else []
+            item_label = ", ".join(str(name) for name in names[:3])
+            if len(names) > 3:
+                item_label += f" and {len(names) - 3} more"
+            total = job.get("bytes_total", 0)
+            completed = job.get("bytes_completed", 0)
+            transfer = f"{format_size(completed)} / {format_size(total)}" if total else "—"
+            when = job.get("finished_at") or job.get("started_at") or job.get("created_at") or ""
+            detail = job.get("error") or job.get("remote_partial_path") or ""
+            rows.append(
+                "<tr>"
+                f"<td>{html.escape(str(job.get('operation', '')))}</td>"
+                f"<td>{html.escape(str(job.get('status', '')))}</td>"
+                f"<td>{html.escape(item_label)}</td>"
+                f"<td>{html.escape(transfer)}</td>"
+                f"<td>{html.escape(str(when).replace('T', ' ').replace('+00:00', ' UTC'))}</td>"
+                f"<td>{html.escape(str(detail))}</td>"
+                "</tr>"
+            )
+        table = "".join(rows) or "<tr><td colspan='6'>No recent transfers.</td></tr>"
+        return (
+            CSS_JS
+            + "<div class='title-row'><h1 class='app-title'>Recent transfers</h1></div>"
+            + "<p class='breadcrumbs'><a href='/'>← Back to files</a></p>"
+            + "<table class='table'><thead><tr><th>Operation</th><th>Status</th>"
+              "<th>Items</th><th>Progress</th><th>When</th><th>Details</th>"
+              "</tr></thead><tbody>" + table + "</tbody></table>"
+        )
 
     @app.route("/job_status", endpoint="job_status")
     def job_status():
@@ -806,14 +873,15 @@ def register(app, DIRECTORIES):
         if extract_dir is None:
             return warn_and_redirect(CSS_JS, "Invalid extract target.",
                                      dir_index, path)
-        os.makedirs(extract_dir, exist_ok=True)
 
         ext = os.path.splitext(archive_full.lower())[1]
         try:
             if ext == ".zip":
                 with zipfile.ZipFile(archive_full) as zf:
+                    members = zf.infolist()
+                    total_size = _validate_archive_size([member.file_size for member in members])
                     real_extract = os.path.realpath(extract_dir)
-                    for member in zf.infolist():
+                    for member in members:
                         target = os.path.realpath(
                             os.path.join(extract_dir, member.filename)
                         )
@@ -822,12 +890,16 @@ def register(app, DIRECTORIES):
                             raise ValueError(f"Unsafe entry: {member.filename}")
                         if stat.S_ISLNK(mode):
                             raise ValueError(f"Archive links are not allowed: {member.filename}")
+                    ensure_free_space(os.path.dirname(extract_dir), total_size)
+                    os.makedirs(extract_dir, exist_ok=True)
                     zf.extractall(extract_dir)
             elif ext in (".tar", ".gz", ".tgz"):
                 mode = "r:gz" if ext in (".gz", ".tgz") else "r"
                 with tarfile.open(archive_full, mode) as tf:
+                    members = tf.getmembers()
+                    total_size = _validate_archive_size([member.size for member in members])
                     real_extract = os.path.realpath(extract_dir)
-                    for member in tf.getmembers():
+                    for member in members:
                         target = os.path.realpath(
                             os.path.join(extract_dir, member.name)
                         )
@@ -835,7 +907,9 @@ def register(app, DIRECTORIES):
                             raise ValueError(f"Unsafe entry: {member.name}")
                         if member.issym() or member.islnk() or member.isdev() or member.isfifo():
                             raise ValueError(f"Unsafe entry type: {member.name}")
-                    tf.extractall(extract_dir, members=tf.getmembers())
+                    ensure_free_space(os.path.dirname(extract_dir), total_size)
+                    os.makedirs(extract_dir, exist_ok=True)
+                    tf.extractall(extract_dir, members=members)
             else:
                 return warn_and_redirect(CSS_JS, f"Unsupported format: {ext}",
                                          dir_index, path)

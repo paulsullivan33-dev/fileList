@@ -14,6 +14,7 @@ APPLICATION_FILES = (
     "start", "run.sh", "README.md", "directories.example.json", "users.example.json",
     "remote_destinations.example.json", "external_sites.example.json",
     "move_downloads.example.json", "tests/test_remote_copy.py", "tests/test_browser.py",
+    "tests/test_safety.py", "tests/test_config_check.py", "tools/check_config.py",
 )
 
 

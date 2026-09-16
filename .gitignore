@@ -30,10 +30,13 @@
 /tests/*
 !/tests/test_remote_copy.py
 !/tests/test_browser.py
+!/tests/test_safety.py
+!/tests/test_config_check.py
 !/tools/
 /tools/*
 !/tools/install.py
 !/tools/build_release.py
+!/tools/check_config.py
 
 # Never include generated Python files, even within allowed directories.
 __pycache__/

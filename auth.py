@@ -1,6 +1,7 @@
 import json
 import os
 import secrets
+import time
 from functools import wraps
 from urllib.parse import urljoin, urlparse
 
@@ -78,6 +79,13 @@ def _is_safe_next(target):
     return redirect_url.scheme in ("http", "https") and redirect_url.netloc == host_url.netloc
 
 
+def _setting(name, default):
+    try:
+        return max(1, int(os.environ.get(name, default)))
+    except (TypeError, ValueError):
+        return default
+
+
 def login_required(view):
     @wraps(view)
     def wrapped(*args, **kwargs):
@@ -102,6 +110,28 @@ def register(app, directories):
             with open(secret_path, "w", encoding="utf-8") as secret_file:
                 secret_file.write(secret_key)
     app.secret_key = secret_key
+    login_attempts = {}
+    login_max_attempts = _setting("LOGIN_MAX_ATTEMPTS", 5)
+    login_window_seconds = _setting("LOGIN_WINDOW_SECONDS", 300)
+    login_lock_seconds = _setting("LOGIN_LOCK_SECONDS", 300)
+
+    def login_key():
+        return request.remote_addr or "unknown"
+
+    def login_locked(key, now):
+        state = login_attempts.get(key)
+        return bool(state and state["locked_until"] > now)
+
+    def record_failed_login(key, now):
+        state = login_attempts.get(key)
+        if state is None or now - state["first_failure"] >= login_window_seconds:
+            state = {"failures": 0, "first_failure": now, "locked_until": 0}
+        state["failures"] += 1
+        if state["failures"] >= login_max_attempts:
+            state["locked_until"] = now + login_lock_seconds
+            state["failures"] = 0
+            state["first_failure"] = now
+        login_attempts[key] = state
 
     @app.before_request
     def require_login():
@@ -128,6 +158,12 @@ def register(app, directories):
         if request.method == "POST":
             username = (request.form.get("username") or "").strip()
             password = request.form.get("password") or ""
+            key = login_key()
+            now = time.monotonic()
+            if login_locked(key, now):
+                return render_template_string(
+                    LOGIN_PAGE, error="Too many sign-in attempts. Please try again later."
+                ), 429
             user = _find_user(app, username)
             password_hash = user.get("password") if user else ""
             try:
@@ -137,12 +173,14 @@ def register(app, directories):
             except (TypeError, ValueError):
                 password_ok = False
             if password_ok:
+                login_attempts.pop(key, None)
                 session.clear()
                 session["username"] = username
                 groups = user.get("groups", "")
                 session["groups"] = [group.strip() for group in groups.split(",") if group.strip()]
                 target = request.args.get("next") or request.form.get("next")
                 return redirect(target if _is_safe_next(target) else url_for("index"))
+            record_failed_login(key, now)
             return render_template_string(LOGIN_PAGE, error="Invalid username or password."), 401
         if "username" in session:
             return redirect(url_for("index"))

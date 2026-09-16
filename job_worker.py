@@ -13,7 +13,7 @@ from pathlib import Path
 
 import config_loader
 import job_store
-from utils import is_safe_path, is_safe_segment, safe_dir_index, safe_join
+from utils import ensure_free_space, is_safe_path, is_safe_segment, safe_dir_index, safe_join
 
 
 CHUNK_SIZE = 4 * 1024 * 1024
@@ -242,6 +242,7 @@ def _run_conversion(job, path, directories):
         raise ValueError("Conversion source no longer exists.")
     if os.path.lexists(output):
         raise FileExistsError(f"Destination already exists: {output_name}")
+    ensure_free_space(os.path.dirname(output), os.path.getsize(source))
     ffmpeg = shutil.which("ffmpeg")
     if not ffmpeg:
         raise RuntimeError("ffmpeg is not installed or is not on PATH.")
