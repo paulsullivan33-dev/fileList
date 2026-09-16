@@ -61,7 +61,8 @@ class RemoteCopyTests(unittest.TestCase):
         users = json.dumps([dict(username="tester", groups="allowed")])
         with patch.object(Path, "open", return_value=io.StringIO(users)), \
                 patch.object(remote_copy, "load_destinations", return_value=[self.destination]), \
-                patch.object(remote_copy, "run_process", side_effect=process):
+                patch.object(remote_copy, "run_process", side_effect=process), \
+                patch.object(remote_copy, "run_rsync", side_effect=lambda command, check, report: process(command, check)):
             # job_store uses builtin open, so only the users file read is mocked.
             remote_copy.run_job(job, path, self.directories, job_worker.Progress, job_worker._check_cancel)
 
@@ -139,12 +140,14 @@ class RemoteCopyTests(unittest.TestCase):
         self.assertIn("-oStrictHostKeyChecking=yes", commands[0])
         self.assertIn("mkdir --", commands[0][-1])
         self.assertEqual(commands[1][0], "rsync")
+        self.assertIn("--info=progress2", commands[1])
         self.assertIn("--protect-args", commands[1])
         self.assertEqual(commands[1][-2], str(self.source / "a file.txt"))
         self.assertIn("mv -T -n --", commands[2][-1])
         record = job_store.read_path(path)
-        self.assertEqual(record["progress_unit"], "items")
-        self.assertEqual(record["bytes_completed"], 1)
+        self.assertEqual(record["progress_unit"], "bytes")
+        self.assertEqual(record["bytes_total"], len("content"))
+        self.assertEqual(record["bytes_completed"], len("content"))
         self.assertIsNone(record["remote_partial_path"])
         self.assertTrue((self.source / "a file.txt").exists())
 
@@ -196,6 +199,15 @@ class RemoteCopyTests(unittest.TestCase):
     def test_process_error_is_reported(self):
         with self.assertRaisesRegex(RuntimeError, "SSH failed"):
             remote_copy.run_process([sys.executable, "-c", "import sys; print('SSH failed'); sys.exit(1)"], lambda: None)
+
+    def test_rsync_progress_is_reported(self):
+        progress = []
+        remote_copy.run_rsync(
+            [sys.executable, "-c", "import sys; sys.stdout.write('  1,024  50%\\r  2,048 100%\\r'); sys.stdout.flush()"],
+            lambda: None,
+            progress.append,
+        )
+        self.assertEqual(progress, [1024, 2048])
 
     def test_running_process_is_stopped_on_cancellation(self):
         def cancel():

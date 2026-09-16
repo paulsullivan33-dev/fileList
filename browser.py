@@ -92,7 +92,13 @@ def register(app, DIRECTORIES):
 
         try:
             entries = sorted(os.listdir(full_path))
-        except (PermissionError, FileNotFoundError, NotADirectoryError) as e:
+        except (FileNotFoundError, NotADirectoryError) as e:
+            # The requested child no longer exists (or was replaced by a file).
+            # Redirecting to the same path would repeat this error forever, so
+            # recover at the selected directory's root instead.
+            return warn_and_redirect(CSS_JS, f"Cannot list directory: {e}",
+                                     dir_index, "")
+        except PermissionError as e:
             return warn_and_redirect(CSS_JS, f"Cannot list directory: {e}",
                                      dir_index, path)
 

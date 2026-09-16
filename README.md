@@ -171,6 +171,17 @@ chmod +x start
 ./start
 ```
 
+To leave fileList running after you close an SSH session, use:
+
+```bash
+./run.sh
+```
+
+It starts `start` in the background and writes application and worker output to
+`run.log`. Follow that file with `tail -f run.log`. For automatic restart after
+a crash or reboot, use the systemd service configuration described in
+[INSTALL.md](INSTALL.md).
+
 By default, job records are stored under
 `~/.local/state/filelist/jobs`. Override that location with `JOB_DATA_DIR`.
 The directory must be local, writable only by the service account, and must not
@@ -238,8 +249,8 @@ its contents are not flattened. Spaces and shell characters are supported.
 Nested symlinks are preserved, not followed. Existing destination names are
 never merged or overwritten. Copies are first staged in a hidden
 `.filelist-<job-id>-<item-number>.partial` directory and published after rsync
-succeeds. Progress counts completed items; a single large item remains at 0/1
-while transferring. Failed or cancelled copies can leave staging directories;
+succeeds. Progress reports transferred bytes while rsync runs. Failed or
+cancelled copies can leave staging directories;
 the job displays the partial path for manual cleanup. A worker crash can also
 leave staging directories. Previously completed items remain if a multi-item
 job fails or is cancelled. Source files should remain unchanged during copying.

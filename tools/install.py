@@ -53,7 +53,7 @@ def install(target, skip_dependencies=False):
         os.close(handle)
         try:
             shutil.copyfile(payload / name, temporary)
-            os.chmod(temporary, 0o755 if name in ("start", "manage_user.py") else 0o644)
+            os.chmod(temporary, 0o755 if name in ("start", "run.sh", "manage_user.py") else 0o644)
             os.replace(temporary, destination)
         finally:
             if os.path.exists(temporary):

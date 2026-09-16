@@ -7,6 +7,7 @@
 !/INSTALL.md
 !/requirements.txt
 !/start
+!/run.sh
 !/actions.py
 !/app.py
 !/auth.py
@@ -28,6 +29,7 @@
 !/tests/
 /tests/*
 !/tests/test_remote_copy.py
+!/tests/test_browser.py
 !/tools/
 /tools/*
 !/tools/install.py

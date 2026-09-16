@@ -11,9 +11,9 @@ APPLICATION_FILES = (
     "actions.py", "app.py", "auth.py", "browser.py", "config_loader.py",
     "job_store.py", "job_worker.py", "manage_user.py", "move_downloads.py",
     "remote_copy.py", "styles.py", "uploads.py", "utils.py", "requirements.txt",
-    "start", "README.md", "directories.example.json", "users.example.json",
+    "start", "run.sh", "README.md", "directories.example.json", "users.example.json",
     "remote_destinations.example.json", "external_sites.example.json",
-    "move_downloads.example.json", "tests/test_remote_copy.py",
+    "move_downloads.example.json", "tests/test_remote_copy.py", "tests/test_browser.py",
 )
 
 
