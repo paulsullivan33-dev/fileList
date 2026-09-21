@@ -13,7 +13,7 @@ from pathlib import Path
 
 import config_loader
 import job_store
-from utils import is_safe_path, is_safe_segment, safe_dir_index, safe_join
+from utils import authorize_job, current_user_groups, ensure_free_space, is_safe_path, is_safe_segment, safe_dir_index, safe_join
 
 
 CHUNK_SIZE = 4 * 1024 * 1024
@@ -75,7 +75,9 @@ class Progress:
         self.total = total
         self.completed = 0
         self.last_update = 0.0
-        job_store.update(job_path, bytes_total=total, bytes_completed=0)
+        self.started = time.monotonic()
+        job_store.update(job_path, bytes_total=total, bytes_completed=0,
+                         bytes_per_second=0, seconds_remaining=None)
 
     def add(self, amount, force=False):
         self.completed += amount
@@ -86,6 +88,10 @@ class Progress:
                 self.path,
                 bytes_total=self.total,
                 bytes_completed=min(self.completed, self.total),
+                bytes_per_second=round(self.completed / max(now - self.started, 0.001), 1),
+                seconds_remaining=(round((self.total - self.completed) /
+                    max(self.completed / max(now - self.started, 0.001), 0.001))
+                    if self.completed else None),
             )
             self.last_update = now
 
@@ -205,11 +211,12 @@ def _run_transfer(job, path, directories):
     items = _validated_items(job, directories)
     total = sum(_measure(source) for source, _ in items)
     progress = Progress(job, path, total)
-    for source, destination in items:
+    for name, (source, destination) in zip(job["source"]["names"], items):
         _check_cancel(job["job_id"])
         if job["operation"] == "move":
             try:
                 _rename_without_replace(source, destination)
+                job_store.complete_item(path, name)
                 progress.add(_measure(destination), force=True)
                 continue
             except OSError as error:
@@ -224,6 +231,7 @@ def _run_transfer(job, path, directories):
                     "Destination completed, but source removal failed; both copies remain: "
                     f"{error}"
                 ) from error
+        job_store.complete_item(path, name)
     progress.add(0, force=True)
 
 
@@ -242,6 +250,7 @@ def _run_conversion(job, path, directories):
         raise ValueError("Conversion source no longer exists.")
     if os.path.lexists(output):
         raise FileExistsError(f"Destination already exists: {output_name}")
+    ensure_free_space(os.path.dirname(output), os.path.getsize(source))
     ffmpeg = shutil.which("ffmpeg")
     if not ffmpeg:
         raise RuntimeError("ffmpeg is not installed or is not on PATH.")
@@ -283,8 +292,10 @@ def run_once():
     job, path = job_store.claim_next()
     if job is None:
         return False
-    directories = config_loader.load_directories()
     try:
+        directories = config_loader.load_directories()
+        if job["operation"] in {"copy", "move", "convert"}:
+            authorize_job(job, directories, current_user_groups(job["owner"]))
         if job["operation"] in {"copy", "move"}:
             _run_transfer(job, path, directories)
         elif job["operation"] == "remote_copy":

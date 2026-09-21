@@ -86,6 +86,17 @@ Run the regression suite after installing dependencies:
 SSH commands are simulated in these tests; verify real remote connectivity on
 each deployment server.
 
+Validate the installed configuration before starting the service or after a
+server change:
+
+```bash
+.venv/bin/python tools/check_config.py
+```
+
+Add `--ssh` to verify each configured remote destination with the same account
+that runs fileList. It checks passwordless SSH, remote-directory write access,
+and remote `rsync` availability without copying files.
+
 A multi-directory, browser-based file manager built with Flask. Manage your files with a clean UI featuring dark mode, archive handling, file previews, and robust path validation — all from a lightweight Python web server.
 
 ## Users and sign-in
@@ -171,6 +182,19 @@ chmod +x start
 ./start
 ```
 
+To leave fileList running after you close an SSH session, use:
+
+```bash
+./run.sh
+```
+
+It starts `start` in the background and writes application and worker output to
+`run.log`. Follow that file with `tail -f run.log`. Shut down that background
+instance cleanly with `./stop.sh`; it signals `start`, which stops Flask and the
+worker, and waits up to ten seconds before forcing termination. For automatic restart after
+a crash or reboot, use the systemd service configuration described in
+[INSTALL.md](INSTALL.md).
+
 By default, job records are stored under
 `~/.local/state/filelist/jobs`. Override that location with `JOB_DATA_DIR`.
 The directory must be local, writable only by the service account, and must not
@@ -183,6 +207,13 @@ JOB_DATA_DIR=/home/filelist/.local/state/filelist/jobs
 JOB_MAX_PENDING_PER_USER=20
 JOB_HISTORY_DAYS=7
 JOB_PROGRESS_INTERVAL=2
+FILELIST_MIN_FREE_BYTES=268435456
+FILELIST_REMOTE_MIN_FREE_BYTES=268435456
+ARCHIVE_MAX_MEMBERS=10000
+ARCHIVE_MAX_UNCOMPRESSED_BYTES=10737418240
+LOGIN_MAX_ATTEMPTS=5
+LOGIN_WINDOW_SECONDS=300
+LOGIN_LOCK_SECONDS=300
 FILELIST_CONFIG=/home/filelist/fileList/directories.json
 ```
 
@@ -190,6 +221,44 @@ Only one worker may use a job directory at a time. Copy and move jobs report
 byte progress, can be cancelled, survive browser navigation, and remain visible
 after Flask restarts. If the worker stops during a job, that job is marked
 failed on the next worker start and can be submitted again.
+
+Open **Recent transfers** from the directory header to review your queued,
+running, completed, failed, and cancelled jobs. Job history is private to the
+signed-in user and is removed according to `JOB_HISTORY_DAYS`.
+Failed and cancelled jobs can be retried from this screen. Active transfers show
+their current rate and a rough remaining-time estimate once progress is available.
+
+Copy, move, and remote-copy jobs record each fully completed item. Retrying creates
+a new job containing only the unfinished items, so completed files do not block
+the remaining selection. Progress on the new job covers that remaining selection.
+Retries recheck current directory and remote-destination permissions; local workers
+also recheck permissions before executing a job.
+
+Completion records are conservative: old jobs without per-item records, or a crash
+between publishing a file and saving its completion record, may still require manual
+inspection of a destination conflict. Existing files are never assumed to be a
+successful transfer. A move whose source could not be removed also requires manual
+inspection. Remote partial files are not resumed byte by byte or automatically deleted.
+
+Uploads show a progress bar and percentage for each file. This measures data sent
+to the server; **Uploaded** appears only after the server confirms success. Failed
+entries remain visible and offer **Retry upload**. Use **Refresh file list** when
+ready to refresh; completing another upload does not clear earlier errors. After
+a network error, check whether the file arrived before retrying to avoid duplicates.
+
+`/health` is an unauthenticated JSON liveness endpoint for a reverse proxy or
+monitor. Signed-in users can open **Configuration** to see only directories and
+remote destinations permitted by their current groups. Send a CSRF-protected POST
+to `/config_reload` after editing configuration files to reload them without
+restarting Flask. Reload validates remote settings and loads the replacement
+directories before replacing the active directory list; a failed reload preserves
+that list. Remote settings continue to be read from disk when used, and the worker
+reads directory configuration when it starts each job.
+
+Archive extraction checks paths, links, entry count, total uncompressed size,
+and available space before writing files. Uploads, video conversion, and remote
+copy staging also reserve free space. The byte settings above show the defaults;
+raise them when the server needs a larger operating-space reserve.
 
 ## Copy to remote servers (Linux)
 
@@ -238,11 +307,18 @@ its contents are not flattened. Spaces and shell characters are supported.
 Nested symlinks are preserved, not followed. Existing destination names are
 never merged or overwritten. Copies are first staged in a hidden
 `.filelist-<job-id>-<item-number>.partial` directory and published after rsync
-succeeds. Progress counts completed items; a single large item remains at 0/1
-while transferring. Failed or cancelled copies can leave staging directories;
+succeeds. Progress reports transferred bytes while rsync runs. Failed or
+cancelled copies can leave staging directories;
 the job displays the partial path for manual cleanup. A worker crash can also
 leave staging directories. Previously completed items remain if a multi-item
 job fails or is cancelled. Source files should remain unchanged during copying.
+
+Use **Browse remote folders** in a remote-server tab to select a child directory
+under that destination's configured `path`. fileList lists only folders below that
+configured root and records the selected path with the queued job. It never permits
+browsing or copying above the configured remote root.
+
+The Select All checkbox chooses only rows currently visible after filtering.
 
 Run the remote-copy regression checks with:
 

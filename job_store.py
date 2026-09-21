@@ -91,6 +91,7 @@ def create(operation, owner, source, destination):
         "status": "pending",
         "bytes_total": 0,
         "bytes_completed": 0,
+        "completed_names": [],
         "created_at": utc_now(),
         "started_at": None,
         "finished_at": None,
@@ -113,6 +114,29 @@ def pending_count(owner=None):
         except (OSError, json.JSONDecodeError):
             continue
     return count
+
+
+def history(owner, limit=50):
+    """Return an owner's newest durable jobs, including completed history."""
+    initialize()
+    try:
+        limit = max(1, min(int(limit), 200))
+    except (TypeError, ValueError):
+        limit = 50
+    records = []
+    for state in STATES:
+        for path in (job_root() / state).glob("*.json"):
+            try:
+                job = read_path(path)
+            except (OSError, json.JSONDecodeError):
+                continue
+            if job.get("owner") == owner:
+                records.append(job)
+    records.sort(
+        key=lambda job: job.get("finished_at") or job.get("started_at") or job.get("created_at") or "",
+        reverse=True,
+    )
+    return records[:limit]
 
 
 def has_active_destination(destination):
@@ -148,6 +172,28 @@ def update(path, **changes):
     job.update(changes)
     _atomic_write(path, job)
     return job
+
+
+def complete_item(path, name):
+    """Persist only items whose transfer has fully succeeded."""
+    job = read_path(path)
+    completed = job.setdefault("completed_names", [])
+    if name not in completed:
+        completed.append(name)
+        _atomic_write(path, job)
+
+
+def retry_selection(job):
+    """Keep completed items out of a retry without trusting destination existence."""
+    source, destination = dict(job["source"]), dict(job["destination"])
+    if job["operation"] in {"copy", "move", "remote_copy"}:
+        completed = set(job.get("completed_names", []))
+        remaining = [name for name in source.get("names", []) if name not in completed]
+        if not remaining:
+            raise ValueError("All selected items already completed; there is nothing to retry.")
+        source["names"] = remaining
+        destination["names"] = remaining
+    return source, destination
 
 
 def finish(path, state, error=None):

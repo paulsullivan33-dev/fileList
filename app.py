@@ -24,6 +24,11 @@ def create_app():
 
     app.config["MAX_CONTENT_LENGTH"] = uploads.MAX_REQUEST_SIZE
 
+    @app.route("/health", endpoint="health")
+    def health():
+        """Unauthenticated, non-sensitive liveness check for monitoring."""
+        return {"status": "ok", "directories": len(DIRECTORIES)}, 200
+
     @app.after_request
     def set_security_headers(resp):
         resp.headers["X-Content-Type-Options"] = "nosniff"

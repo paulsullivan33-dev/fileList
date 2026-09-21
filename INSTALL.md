@@ -109,7 +109,23 @@ Run checks after installation with:
 
 ```bash
 .venv/bin/python -m unittest discover -s tests -v
+.venv/bin/python tools/check_config.py
 ```
+
+Use `.venv/bin/python tools/check_config.py --ssh` after configuring remote
+destinations to verify SSH, remote write access, and rsync without transferring
+files.
+
+After upgrading, reload the browser to load the new upload queue and retry controls.
+Failed uploads remain visible until you choose **Refresh file list**. Transfer
+retries skip items recorded as completed by this version; older failed jobs without
+those records may still need manual inspection of destination conflicts. Group
+permissions are checked again when retrying and when local jobs execute.
+
+For deployment validation, use a disposable source and destination to check an
+SSH/rsync copy, an interrupted transfer and retry, and `./run.sh` / `./stop.sh`.
+The unit suite simulates most SSH operations; passing it does not verify the
+production service account's SSH keys, host keys, or directory permissions.
 
 The same ZIP can be used on each Linux server. Configure each new server separately;
 upgrades preserve its settings. `--skip-dependencies` is available only when you

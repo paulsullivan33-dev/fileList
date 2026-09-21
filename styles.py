@@ -95,6 +95,13 @@ body { font-family: system-ui, sans-serif; margin: 20px; }
     color: #4caf50;
 }
 #uploadInput { display: none; }
+#uploadQueue { margin: 6px 0 14px; max-width: 720px; }
+.upload-item { display: grid; grid-template-columns: minmax(120px, 1fr) minmax(120px, 2fr) 42px minmax(90px, auto); align-items: center; gap: 8px; padding: 5px 8px; background: #f7f7f7; border-bottom: 1px solid #e5e5e5; font-size: 12px; }
+.upload-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.upload-item progress { width: 100%; height: 10px; accent-color: #4caf50; }
+.upload-percent { color: #666; text-align: right; }
+.upload-result.success { color: #267a3d; }
+.upload-result.error { color: #b71c1c; }
 
 .toolbar {
     display: flex;
@@ -148,6 +155,8 @@ body { font-family: system-ui, sans-serif; margin: 20px; }
 }
 .table th.sortable { cursor: pointer; }
 .table th.sortable:hover { background: #3b3b3b; }
+.table th.sorted { background: #3b3b3b; }
+.sort-indicator { color: #9fe3a7; font-size: 11px; }
 
 .table td {
     padding: 8px 12px;
@@ -279,6 +288,8 @@ html.dark-mode .table { background: #2b2b2b; }
 html.dark-mode .table td { color: #e8e8e8; border-bottom-color: #3b3b3b; }
 html.dark-mode .table tr:hover { background: #333; }
 html.dark-mode .stats { background: #2b2b2b; color: #aaa; }
+html.dark-mode .upload-item { background: #2b2b2b; border-bottom-color: #444; }
+html.dark-mode .upload-percent { color: #aaa; }
 html.dark-mode .action-box { background: #2b2b2b; }
 html.dark-mode #searchInput { background: #2b2b2b; color: #e0e0e0; border-color: #444; }
 html.dark-mode .breadcrumbs a { color: #81c784; }

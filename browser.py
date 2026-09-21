@@ -92,7 +92,13 @@ def register(app, DIRECTORIES):
 
         try:
             entries = sorted(os.listdir(full_path))
-        except (PermissionError, FileNotFoundError, NotADirectoryError) as e:
+        except (FileNotFoundError, NotADirectoryError) as e:
+            # The requested child no longer exists (or was replaced by a file).
+            # Redirecting to the same path would repeat this error forever, so
+            # recover at the selected directory's root instead.
+            return warn_and_redirect(CSS_JS, f"Cannot list directory: {e}",
+                                     dir_index, "")
+        except PermissionError as e:
             return warn_and_redirect(CSS_JS, f"Cannot list directory: {e}",
                                      dir_index, path)
 
@@ -286,7 +292,7 @@ def register(app, DIRECTORIES):
             rows_html += (
                 f"<tr{r['row_attr']} data-name='{html.escape(r['display_name'])}' "
                 f"data-isdir='{is_dir_flag}'>"
-                f"<td><input type='checkbox' class='sel' "
+                f"<td><input type='checkbox' class='sel' {'disabled' if r['display_name'] == '..' else ''} "
                 f"value='{html.escape(r['display_name'])}' "
                 f"data-encoded='{r['encoded']}'></td>"
                 f"<td class='filename' data-sort='{html.escape(r['display_name'].lower())}'>"
@@ -302,7 +308,7 @@ def register(app, DIRECTORIES):
                 f"</td>"
                 f"<td class='preview-col'>{r['preview_html']}</td>"
                 f"<td class='size' data-sort='{r['size_raw']}'>{r['size_display']}</td>"
-                f"<td class='mtime'>{r['mtime_display']}</td>"
+                f"<td class='mtime' data-sort='{html.escape(r['mtime_display'])}'>{r['mtime_display']}</td>"
                 f"<td class='actions'>{r['actions_html']}</td>"
                 "</tr>"
             )
@@ -323,6 +329,8 @@ def register(app, DIRECTORIES):
             + f"<div class='header'>"
                f"<span style='color:white;'>Select Directory:</span> "
                f"{dir_tabs_html}"
+               f"<a class='header-link' href='/jobs'>Recent transfers</a>"
+               f"<a class='header-link' href='/configuration'>Configuration</a>"
                f"<span class='dark-toggle' onclick='toggleDark()'>🌓 Theme</span>"
                f"<form class='logout-form' method='post' action='/logout'>"
                f"<input type='hidden' name='csrf_token' value='{generate_csrf()}'>"
@@ -334,25 +342,26 @@ def register(app, DIRECTORIES):
             + f"<input type='hidden' id='csrfToken' value='{generate_csrf()}'>"
             + stats_html
             + f"""
-            <div id='dropZone'>⬆️ Drop files here or click to upload</div>
+            <div id='dropZone' role='button' tabindex='0' aria-controls='uploadInput'>⬆️ Drop files here or click to upload</div>
             <input type='file' id='uploadInput' multiple />
+            <div id='uploadQueue' aria-live='polite'></div>
 
             <div class='toolbar'>
                 <button class='toolbar-btn primary' onclick='newFolder()'>📁 New Folder</button>
                 <button class='toolbar-btn' onclick='createArchiveDialog()'>🗜️ Archive</button>
                 <button class='toolbar-btn danger' onclick='bulkDelete()'>🗑️ Delete Selected</button>
                 <button class='toolbar-btn' onclick='bulkMove()'>📦 Move Selected</button>
-                <input id='searchInput' placeholder='🔍 Filter...' oninput='filterTable()'>
+                <input id='searchInput' type='search' placeholder='🔍 Filter files...' aria-label='Filter files'>
             </div>
 
             <table class='table' id='fileTable'>
             <thead>
             <tr>
                 <th><input type='checkbox' onclick='toggleAll(this)'></th>
-                <th class='sortable' onclick='sortTable(1)'>Name</th>
+                <th class='sortable' data-sort-col='1' onclick='sortTable(1)'>Name <span class='sort-indicator'></span></th>
                 <th class='preview-col'>Preview</th>
-                <th class='sortable size' onclick='sortTable(3)'>Size</th>
-                <th class='sortable mtime' onclick='sortTable(4)'>Modified</th>
+                <th class='sortable size' data-sort-col='3' onclick='sortTable(3)'>Size <span class='sort-indicator'></span></th>
+                <th class='sortable mtime' data-sort-col='4' onclick='sortTable(4)'>Modified <span class='sort-indicator'></span></th>
                 <th>Actions</th>
             </tr>
             </thead>
@@ -449,6 +458,10 @@ function showJob(job) {
         (job.progress_unit === 'items' ? ` (${completed}/${total} items)` :
             (percent === null ? '' : ` (${percent}%)`)) + ' ';
     if (job.error) row.appendChild(document.createTextNode(job.error + ' '));
+    if (job.bytes_per_second) {
+        const eta = job.seconds_remaining == null ? '' : ` · about ${Math.ceil(job.seconds_remaining)}s left`;
+        row.appendChild(document.createTextNode(`${formatBytes(job.bytes_per_second)}/s${eta} `));
+    }
     if (job.remote_partial_path && ['failed', 'cancelled'].includes(job.status)) {
         row.appendChild(document.createTextNode('Partial remote copy: ' + job.remote_partial_path + ' '));
     }
@@ -457,6 +470,41 @@ function showJob(job) {
         cancel.type = 'button'; cancel.textContent = 'Cancel';
         cancel.onclick = () => cancelJob(job.job_id);
         row.appendChild(cancel);
+    }
+    if (['failed', 'cancelled'].includes(job.status)) {
+        const retry = document.createElement('button');
+        retry.type = 'button'; retry.textContent = 'Retry';
+        retry.onclick = () => retryJob(job.job_id, retry);
+        row.appendChild(retry);
+    }
+}
+
+function formatBytes(value) {
+    const units = ['B', 'KB', 'MB', 'GB', 'TB']; let n = Number(value || 0), i = 0;
+    while (n >= 1024 && i < units.length - 1) { n /= 1024; i++; }
+    return `${n.toFixed(i ? 1 : 0)} ${units[i]}`;
+}
+
+async function retryJob(jobId, button = null) {
+    if (button) button.disabled = true;
+    const fd = new FormData(); fd.append('job_id', jobId);
+    try {
+        const response = await csrfFetch('/job_retry', {
+            method: 'POST', headers: {'Accept': 'application/json'}, body: fd
+        });
+        const data = await response.json().catch(() => ({}));
+        if (!response.ok || !data.success || !data.job_id) {
+            alert(data.error || 'Retry failed');
+            return;
+        }
+        rememberJob(data);
+        forgetJob(jobId);
+        showJob(data);
+        pollJob(data.job_id);
+    } catch (error) {
+        alert('Retry could not be confirmed. Check Recent transfers before trying again.');
+    } finally {
+        if (button) button.disabled = false;
     }
 }
 
@@ -531,12 +579,20 @@ function toggleDark() {
 // Sorting
 // -----------------------------------------------------------------
 function sortTable(col) {
+    const nextDir = (state.sortCol === col && state.sortDir === 'asc') ? 'desc' : 'asc';
+    applySort(col, nextDir);
+}
+
+function applySort(col, dir) {
     const tbody = document.querySelector('#fileTable tbody');
     const rows = Array.from(tbody.querySelectorAll('tr'));
-    const dir = (state.sortCol === col && state.sortDir === 'asc') ? 'desc' : 'asc';
     state.sortCol = col;
     state.sortDir = dir;
     saveState();
+    const url = new URL(window.location.href);
+    url.searchParams.set('sort', col);
+    url.searchParams.set('order', dir);
+    history.replaceState(null, '', url);
 
     const isDir = r => r.dataset.isdir === '1';
     const cell = (r, i) => r.cells[i] || {dataset: {sort: ''}, textContent: ''};
@@ -558,13 +614,29 @@ function sortTable(col) {
     });
 
     rows.forEach(r => tbody.appendChild(r));
+    document.querySelectorAll('[data-sort-col]').forEach(header => {
+        const active = Number(header.dataset.sortCol) === col;
+        header.classList.toggle('sorted', active);
+        const indicator = header.querySelector('.sort-indicator');
+        if (indicator) indicator.textContent = active ? (dir === 'asc' ? ' ▲' : ' ▼') : '';
+        header.setAttribute('aria-sort', active ? (dir === 'asc' ? 'ascending' : 'descending') : 'none');
+    });
 }
 
 // -----------------------------------------------------------------
 // Filtering
 // -----------------------------------------------------------------
 function filterTable() {
-    const q = document.getElementById('searchInput').value.toLowerCase();
+    const q = document.getElementById('searchInput').value.trim().toLowerCase();
+    state.search = q;
+    saveState();
+    const url = new URL(window.location.href);
+    if (q) url.searchParams.set('q', q); else url.searchParams.delete('q');
+    if (state.sortCol !== undefined) {
+        url.searchParams.set('sort', state.sortCol);
+        url.searchParams.set('order', state.sortDir);
+    }
+    history.replaceState(null, '', url);
     let shown = 0;
     document.querySelectorAll('#fileTable tbody tr').forEach(r => {
         const name = (r.dataset.name || '').toLowerCase();
@@ -580,7 +652,12 @@ function filterTable() {
 // Selection
 // -----------------------------------------------------------------
 function toggleAll(cb) {
-    document.querySelectorAll('.sel').forEach(x => x.checked = cb.checked);
+    document.querySelectorAll('#fileTable tbody tr').forEach(row => {
+        if (row.style.display !== 'none' && row.dataset.name !== '..') {
+            const checkbox = row.querySelector('.sel');
+            if (checkbox) checkbox.checked = cb.checked;
+        }
+    });
 }
 
 function getSelected() {
@@ -832,24 +909,88 @@ async function uploadFiles(files) {
     if (!files.length) return;
     const dir  = document.getElementById('currentDir').value;
     const path = document.getElementById('currentPath').value;
-    const fd = new FormData();
-    fd.append('dir', dir);
-    fd.append('path', path);
-    files.forEach(f => fd.append('files', f));
-
-    try {
-        const r = await csrfFetch('/upload', { method: 'POST', body: fd });
-        const data = await r.json().catch(() => ({}));
-        if (data.success) {
-            flash('Upload complete');
-            setTimeout(() => location.reload(), 600);
-        } else {
-            alert('Upload failed: ' +
-                  (data.error || JSON.stringify(data.errors) || `Server returned ${r.status}`));
-        }
-    } catch (e) {
-        alert('Upload error: ' + e);
+    const queue = document.getElementById('uploadQueue');
+    const entries = files.map(file => {
+        const row = document.createElement('div');
+        row.className = 'upload-item';
+        row.innerHTML = `<span class="upload-name"></span><progress max="100" value="0"></progress><span class="upload-percent">0%</span><span class="upload-result"></span>`;
+        row.querySelector('.upload-name').textContent = file.name;
+        const retry = document.createElement('button');
+        retry.type = 'button'; retry.textContent = 'Retry upload'; retry.hidden = true;
+        row.appendChild(retry);
+        queue.appendChild(row);
+        const run = async () => {
+            if (retry.disabled) return false;
+            retry.disabled = true;
+            const success = await uploadOne(file, row, dir, path);
+            retry.hidden = success;
+            retry.disabled = false;
+            return success;
+        };
+        retry.onclick = run;
+        return {run};
+    });
+    let completed = 0;
+    for (const entry of entries) {
+        if (await entry.run()) completed++;
     }
+    const failed = entries.length - completed;
+    flash(`${completed} uploaded${failed ? `, ${failed} failed — see details below` : ''}`);
+    // Keep results and failed files available, even if another batch succeeds.
+    if (!queue.querySelector('.upload-refresh')) {
+        const refresh = document.createElement('button');
+        refresh.type = 'button'; refresh.className = 'upload-refresh';
+        refresh.textContent = 'Refresh file list';
+        refresh.onclick = () => location.reload();
+        queue.appendChild(refresh);
+    }
+}
+
+function uploadOne(file, row, dir, path) {
+    return new Promise(resolve => {
+        const progress = row.querySelector('progress');
+        const percent = row.querySelector('.upload-percent');
+        const result = row.querySelector('.upload-result');
+        progress.value = 0;
+        percent.textContent = '0%';
+        result.textContent = 'Uploading…';
+        result.className = 'upload-result';
+        const xhr = new XMLHttpRequest();
+        xhr.open('POST', '/upload');
+        xhr.setRequestHeader('X-CSRFToken', csrfToken);
+        xhr.upload.addEventListener('progress', event => {
+            if (!event.lengthComputable) return;
+            const value = Math.round(event.loaded * 100 / event.total);
+            progress.value = value;
+            percent.textContent = `${value}%`;
+        });
+        xhr.addEventListener('load', () => {
+            let data = {};
+            try { data = JSON.parse(xhr.responseText); } catch (e) {}
+            if (xhr.status >= 200 && xhr.status < 300 && data.success) {
+                progress.value = 100;
+                percent.textContent = '100%';
+                result.textContent = 'Uploaded';
+                result.className = 'upload-result success';
+                resolve(true);
+            } else {
+                result.textContent = data.error || data.errors?.[0]?.error || `Upload failed (${xhr.status})`;
+                result.className = 'upload-result error';
+                resolve(false);
+            }
+        });
+        const fail = message => {
+            result.textContent = message;
+            result.className = 'upload-result error';
+            resolve(false);
+        };
+        xhr.addEventListener('error', () => fail('Network error. Check the file list before retrying.'));
+        xhr.addEventListener('abort', () => fail('Upload cancelled.'));
+        xhr.addEventListener('timeout', () => fail('Upload timed out. Check the file list before retrying.'));
+        const fd = new FormData();
+        fd.append('dir', dir); fd.append('path', path); fd.append('files', file);
+        try { xhr.send(fd); } catch (error) { fail('Could not start upload.'); }
+    });
 }
 
 // -----------------------------------------------------------------
@@ -910,13 +1051,23 @@ function hidePreview() { if (previewModal) previewModal.style.display = "none"; 
 // Init
 // -----------------------------------------------------------------
 window.addEventListener('DOMContentLoaded', () => {
-    if (state.sortCol !== undefined) sortTable(state.sortCol);
     const q = document.getElementById('searchInput');
-    if (q && state.search) { q.value = state.search; filterTable(); }
+    const params = new URLSearchParams(window.location.search);
+    const query = params.get('q') || state.search || '';
+    if (q && query) q.value = query;
+    const sortCol = Number(params.get('sort'));
+    const sortDir = params.get('order');
+    if ([1, 3, 4].includes(sortCol) && ['asc', 'desc'].includes(sortDir)) {
+        applySort(sortCol, sortDir);
+    } else if ([1, 3, 4].includes(Number(state.sortCol))) {
+        applySort(Number(state.sortCol), state.sortDir === 'desc' ? 'desc' : 'asc');
+    }
+    if (q && q.value) filterTable();
     q?.addEventListener('input', () => {
-        state.search = q.value;
-        saveState();
         filterTable();
+    });
+    dropZone.addEventListener('keydown', e => {
+        if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); fileInput.click(); }
     });
 });
 </script>

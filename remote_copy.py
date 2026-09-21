@@ -9,7 +9,10 @@ import tempfile
 import time
 from pathlib import Path
 
-from utils import is_safe_path, is_safe_segment, safe_dir_index, safe_join, user_can_access_directory
+from utils import is_safe_path, is_safe_segment, remote_minimum_free_bytes, safe_dir_index, safe_join, user_can_access_directory
+
+
+RSYNC_PROGRESS = re.compile(r"(?:^|[\r\n])\s*([0-9][0-9,]*)\s+\d+%")
 
 
 def load_destinations():
@@ -69,6 +72,50 @@ def destination_for(destination_id, groups):
     raise PermissionError("Remote destination is unavailable or not permitted.")
 
 
+def with_subpath(destination, subpath):
+    """Return a destination restricted to a browsed child path."""
+    if (not isinstance(subpath, str) or posixpath.isabs(subpath)
+            or "\\" in subpath or any(ord(c) < 32 for c in subpath)
+            or not is_safe_path(subpath)):
+        raise ValueError("Invalid remote directory path.")
+    result = dict(destination)
+    if not subpath:
+        return result
+    root = posixpath.normpath(destination["path"])
+    selected = posixpath.normpath(posixpath.join(root, subpath))
+    if posixpath.commonpath([root, selected]) != root:
+        raise ValueError("Remote directory is outside the configured root.")
+    result["path"] = selected
+    result["base_path"] = destination["path"]
+    result["subpath"] = subpath
+    return result
+
+
+def _containment_check(destination):
+    """Check resolved paths on the remote host, including symlink components."""
+    root = shlex.quote(destination.get("base_path", destination["path"]))
+    selected = shlex.quote(destination["path"])
+    return (
+        f"root=$(realpath -e -- {root}) && selected=$(realpath -e -- {selected}) && "
+        'root=${root%/} && case "$selected/" in "$root/"*) ;; '
+        '*) echo "Remote directory is outside the configured root" >&2; exit 1;; esac'
+    )
+
+
+def list_directories(destination, subpath=""):
+    """List immediate remote child directories without interpreting server output as shell code."""
+    selected = with_subpath(destination, subpath)
+    command = (_containment_check(selected) + f" && test -d {shlex.quote(selected['path'])} && cd {shlex.quote(selected['path'])} "
+               "&& find . -mindepth 1 -maxdepth 1 -type d -printf '%f\\n'")
+    result = subprocess.run(ssh_command(destination) + [destination["host"], command], stdin=subprocess.DEVNULL,
+                            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=20, check=False)
+    if result.returncode:
+        raise RuntimeError(result.stdout.strip()[-500:] or "Cannot list remote directory.")
+    names = sorted({line.strip() for line in result.stdout.splitlines()
+                    if is_safe_segment(line.strip()) and "/" not in line.strip()})
+    return {"path": subpath, "directories": names}
+
+
 def selector_html(index, path, names, local_tabs=""):
     import html
     from flask import session
@@ -100,8 +147,10 @@ def selector_html(index, path, names, local_tabs=""):
             "<form method='post' action='/remote_copy'>"
             f"<p><strong>{escape(destination['name'])}</strong> · {escape(host)}</p>"
             f"<p class='destination-path'>{escape(destination['path'])}</p>"
+            f"<div class='remote-browser' data-remote-id='{escape(destination['id'])}'><button type='button' onclick='browseRemote(this, \"\")'>Browse remote folders</button><span class='remote-path'></span><ul></ul></div>"
             "<p>Copy here and keep the local original.</p>"
             + "".join(f"<input type='hidden' name='{key}' value='{escape(value)}'>" for key, value in fields)
+            + "<input type='hidden' name='remote_subpath' value=''>"
             + "<button class='move-here-btn' type='submit'>Copy here</button></form></div>"
         )
     return (
@@ -117,6 +166,18 @@ function selectRemoteDestination(button) {
         tab.setAttribute('aria-expanded', tab === button ? 'true' : 'false');
     });
     document.getElementById('local-destination-panel').hidden = true;
+}
+async function browseRemote(button, path) {
+    const box = button.closest('.remote-browser');
+    const form = box.closest('form');
+    const response = await fetch('/remote_directories?remote_id=' + encodeURIComponent(box.dataset.remoteId) + '&path=' + encodeURIComponent(path));
+    const data = await response.json().catch(() => ({}));
+    if (!response.ok || !data.success) { alert(data.error || 'Could not list remote folders'); return; }
+    form.querySelector('[name=remote_subpath]').value = data.path;
+    box.querySelector('.remote-path').textContent = data.path ? ' / ' + data.path : ' /';
+    const list = box.querySelector('ul'); list.replaceChildren();
+    if (data.path) { const up = document.createElement('button'); up.type = 'button'; up.textContent = '↑ Up'; up.onclick = () => browseRemote(up, data.path.split('/').slice(0, -1).join('/')); list.appendChild(up); }
+    for (const name of data.directories) { const item = document.createElement('button'); item.type = 'button'; item.textContent = '📁 ' + name; item.onclick = () => browseRemote(item, data.path ? data.path + '/' + name : name); list.appendChild(item); }
 }
 </script>"""
     )
@@ -154,6 +215,73 @@ def run_process(command, check_cancel):
                     process.wait()
 
 
+def _measure(path):
+    """Count transferable bytes without following symlinks."""
+    if os.path.islink(path):
+        return 0
+    if os.path.isfile(path):
+        return os.path.getsize(path)
+    total = 0
+    for root, directories, files in os.walk(path, followlinks=False):
+        directories[:] = [name for name in directories if not os.path.islink(os.path.join(root, name))]
+        for name in files:
+            candidate = os.path.join(root, name)
+            if not os.path.islink(candidate):
+                total += os.path.getsize(candidate)
+    return total
+
+
+def run_rsync(command, check_cancel, report_progress):
+    """Run rsync while tailing its progress output without blocking on errors."""
+    handle, log_name = tempfile.mkstemp(prefix="filelist-rsync-", suffix=".log")
+    os.close(handle)
+    try:
+        with open(log_name, "wb") as log, open(log_name, "rb") as reader:
+            process = subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=log, stderr=log)
+            offset = 0
+            pending = ""
+            output_tail = ""
+            try:
+                while process.poll() is None:
+                    check_cancel()
+                    reader.seek(offset)
+                    chunk = reader.read()
+                    offset += len(chunk)
+                    if chunk:
+                        text = chunk.decode("utf-8", "replace")
+                        output_tail = (output_tail + text)[-3000:]
+                        pending += text
+                        records = re.split(r"[\r\n]", pending)
+                        pending = records.pop()
+                        for record in records:
+                            match = RSYNC_PROGRESS.search("\n" + record)
+                            if match:
+                                report_progress(int(match.group(1).replace(",", "")))
+                    time.sleep(0.2)
+                log.flush()
+                reader.seek(offset)
+                text = reader.read().decode("utf-8", "replace")
+                output_tail = (output_tail + text)[-3000:]
+                pending += text
+                for match in RSYNC_PROGRESS.finditer("\n" + pending):
+                    report_progress(int(match.group(1).replace(",", "")))
+                if process.returncode:
+                    raise RuntimeError(output_tail.strip() or f"Transfer command failed ({process.returncode}).")
+            finally:
+                if process.poll() is None:
+                    process.terminate()
+                    try:
+                        process.wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        process.kill()
+                        process.wait()
+    finally:
+        try:
+            os.unlink(log_name)
+        except FileNotFoundError:
+            pass
+
+
 def run_job(job, job_path, directories, progress_class, check_cancel):
     import job_store
     # Re-read authorization at execution time; queued jobs do not carry privileges.
@@ -163,41 +291,58 @@ def run_job(job, job_path, directories, progress_class, check_cancel):
     groups = [g.strip() for g in user.get("groups", "").split(",") if g.strip()] if user else []
     info = job["source"]
     _, sources = validate_sources(info.get("directory_index"), info.get("path", ""), info.get("names"), directories, groups)
-    destination = destination_for(job["destination"].get("remote_id"), groups)
-    if destination != job["destination"].get("configuration"):
+    configured = destination_for(job["destination"].get("remote_id"), groups)
+    submitted = job["destination"].get("configuration") or {}
+    destination = with_subpath(configured, submitted.get("subpath", ""))
+    if destination != submitted:
         raise ValueError("Remote configuration changed since submission; submit the copy again.")
-    # Item-level progress avoids implying that queued bytes are already transferred.
-    progress = progress_class(job, job_path, len(sources))
-    job_store.update(job_path, progress_unit="items")
+    progress = progress_class(job, job_path, sum(_measure(source) for _, source in sources))
+    job_store.update(job_path, progress_unit="bytes")
     ssh = ssh_command(destination)
     check = lambda: check_cancel(job["job_id"])
     quote = shlex.quote
     for ordinal, (name, source) in enumerate(sources):
         check()
+        item_total = _measure(source)
+        item_completed = 0
+
+        def report_progress(transferred):
+            nonlocal item_completed
+            current = min(max(transferred, 0), item_total)
+            if current > item_completed:
+                progress.add(current - item_completed)
+                item_completed = current
+
         target = posixpath.join(destination["path"], name)
         stage = posixpath.join(destination["path"], f".filelist-{job['job_id']}-{ordinal}.partial")
         # The staging directory is unique and created exclusively. No remote deletion
         # is attempted on failure: interrupted work remains recognizable for cleanup.
         prepare = (
+            _containment_check(destination) + " && "
             f"test -d {quote(destination['path'])} && "
+            f"available=$(df -Pk -- {quote(destination['path'])} | awk 'NR == 2 {{print $4 * 1024}}') && "
+            f"test -n \"$available\" && test \"$available\" -ge {item_total + remote_minimum_free_bytes()} || "
+            "{ echo 'Not enough free disk space on remote destination' >&2; exit 1; } && "
             f"if test -e {quote(target)} || test -L {quote(target)}; then "
             "echo 'Destination already exists' >&2; exit 1; fi && "
             f"mkdir -- {quote(stage)}"
         )
         run_process(ssh + [destination["host"], prepare], check)
         job_store.update(job_path, remote_partial_path=stage)
-        # --protect-args preserves spaces/shell characters; -l preserves symlinks
-        # inside directories instead of following them outside the selected tree.
-        run_process(["rsync", "-rlpt", "--protect-args", "-e", shlex.join(ssh), "--",
-                     source, f"{destination['host']}:{stage}/"], check)
+        # --info=progress2 gives byte progress for the job status UI. --protect-args
+        # preserves spaces/shell characters; -l preserves symlinks inside directories.
+        run_rsync(["rsync", "-rlpt", "--info=progress2", "--protect-args", "-e", shlex.join(ssh), "--",
+                   source, f"{destination['host']}:{stage}/"], check, report_progress)
         check()
         staged_item = posixpath.join(stage, os.path.basename(source))
         publish = (
+            _containment_check(destination) + " && "
             f"mv -T -n -- {quote(staged_item)} {quote(target)} && "
             f"if test -e {quote(staged_item)} || test -L {quote(staged_item)}; then "
             "echo 'Destination already exists; staged copy retained' >&2; exit 1; fi && "
             f"rmdir -- {quote(stage)}"
         )
         run_process(ssh + [destination["host"], publish], check)
+        job_store.complete_item(job_path, name)
         job_store.update(job_path, remote_partial_path=None)
-        progress.add(1, force=True)
+        progress.add(item_total - item_completed, force=True)
