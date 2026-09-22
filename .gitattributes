@@ -7,3 +7,4 @@
 *.txt text eol=lf
 start text eol=lf
 *.zip binary
+*.sh text eol=lf
