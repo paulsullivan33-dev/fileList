@@ -593,6 +593,7 @@ function applySort(col, dir) {
     url.searchParams.set('sort', col);
     url.searchParams.set('order', dir);
     history.replaceState(null, '', url);
+    carrySortInLinks(col, dir);
 
     const isDir = r => r.dataset.isdir === '1';
     const cell = (r, i) => r.cells[i] || {dataset: {sort: ''}, textContent: ''};
@@ -623,13 +624,23 @@ function applySort(col, dir) {
     });
 }
 
+// The URL is the only place the sort is kept, so folder, breadcrumb and
+// directory-tab links carry it forward. The filter is deliberately not
+// carried: it applies to the folder it was typed in.
+function carrySortInLinks(col, dir) {
+    document.querySelectorAll('a[href^="/?"]').forEach(link => {
+        const url = new URL(link.getAttribute('href'), window.location.origin);
+        url.searchParams.set('sort', col);
+        url.searchParams.set('order', dir);
+        link.setAttribute('href', url.pathname + url.search);
+    });
+}
+
 // -----------------------------------------------------------------
 // Filtering
 // -----------------------------------------------------------------
 function filterTable() {
     const q = document.getElementById('searchInput').value.trim().toLowerCase();
-    state.search = q;
-    saveState();
     const url = new URL(window.location.href);
     if (q) url.searchParams.set('q', q); else url.searchParams.delete('q');
     if (state.sortCol !== undefined) {
@@ -1053,18 +1064,17 @@ function hidePreview() { if (previewModal) previewModal.style.display = "none"; 
 window.addEventListener('DOMContentLoaded', () => {
     const q = document.getElementById('searchInput');
     const params = new URLSearchParams(window.location.search);
-    const query = params.get('q') || state.search || '';
+    // Sort and filter come only from this page's URL. Restoring them from
+    // localStorage leaked the previous folder's state: the sort toggle
+    // alternated direction and an old filter hid files in the new folder.
+    delete state.search;
+    const query = params.get('q') || '';
     if (q && query) q.value = query;
     const sortCol = Number(params.get('sort'));
     const sortDir = params.get('order');
     if ([1, 3, 4].includes(sortCol) && ['asc', 'desc'].includes(sortDir)) {
         applySort(sortCol, sortDir);
     } else {
-        // Fresh navigation: always start from Name/ascending. Restoring the
-        // previous page's persisted direction made the header toggle alternate
-        // between ascending and descending on every folder change.
-        delete state.sortCol;
-        delete state.sortDir;
         applySort(1, 'asc');
     }
     if (q && q.value) filterTable();
