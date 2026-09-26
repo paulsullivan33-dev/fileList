@@ -1059,8 +1059,13 @@ window.addEventListener('DOMContentLoaded', () => {
     const sortDir = params.get('order');
     if ([1, 3, 4].includes(sortCol) && ['asc', 'desc'].includes(sortDir)) {
         applySort(sortCol, sortDir);
-    } else if ([1, 3, 4].includes(Number(state.sortCol))) {
-        applySort(Number(state.sortCol), state.sortDir === 'desc' ? 'desc' : 'asc');
+    } else {
+        // Fresh navigation: always start from Name/ascending. Restoring the
+        // previous page's persisted direction made the header toggle alternate
+        // between ascending and descending on every folder change.
+        delete state.sortCol;
+        delete state.sortDir;
+        applySort(1, 'asc');
     }
     if (q && q.value) filterTable();
     q?.addEventListener('input', () => {
