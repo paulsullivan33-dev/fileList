@@ -1,15 +1,13 @@
 """Move downloaded files or directories to configured destinations.
 
-Each non-empty row in downloaded.txt must contain:
+Reads the same downloaded.txt history file that superFetch writes. Each
+line is ``title,category`` and the category selects the destination
+through the ``destinations`` object in the JSON configuration file.
 
-    item_name,destination_key
-
-The destination key is resolved through the ``destinations`` object in the
-JSON configuration file.
+Use ``--dry-run`` to print what would move without moving anything.
 """
 
 import argparse
-import csv
 import json
 import shutil
 from datetime import datetime
@@ -53,20 +51,28 @@ def load_config(config_path):
 
 
 def load_rules(downloaded_file):
+    """Reads the shared downloaded.txt history (the same file superFetch writes).
+
+    Each line is ``title,category``. The split is on the LAST comma, exactly
+    like superFetch parses it, so titles containing commas still map to the
+    right item and destination.
+    """
     rules = {}
     try:
-        with downloaded_file.open("r", encoding="utf-8-sig", newline="") as rule_file:
-            for line_number, row in enumerate(csv.reader(rule_file), start=1):
-                if not row or all(not field.strip() for field in row):
+        with downloaded_file.open("r", encoding="utf-8-sig") as rule_file:
+            for line_number, line in enumerate(rule_file, start=1):
+                record = line.rstrip("\r\n")
+                if not record.strip():
                     continue
-                if len(row) < 2:
+                item_name, separator, destination_key = record.rpartition(",")
+                item_name = item_name.strip()
+                destination_key = destination_key.strip()
+                if not separator:
                     print(
                         f"Skipped rule line {line_number}: "
-                        "expected item_name,destination_key"
+                        "expected title,category"
                     )
                     continue
-                item_name = row[0].strip()
-                destination_key = row[1].strip()
                 if not item_name or not destination_key:
                     print(f"Skipped rule line {line_number}: empty field")
                     continue
