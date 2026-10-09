@@ -5,13 +5,32 @@ line is ``title,category`` and the category selects the destination
 through the ``destinations`` object in the JSON configuration file.
 
 Use ``--dry-run`` to print what would move without moving anything.
+
+Completed download folders are matched by release title: SABnzbd names
+them after the NZB filename, which superFetch suffixes with a 16-hex
+identity hash, so that suffix is stripped for matching (the item keeps
+its real name when moved).
 """
 
 import argparse
 import json
+import re
 import shutil
 from datetime import datetime
 from pathlib import Path
+
+
+# SABnzbd names each completed job folder after the NZB filename, and
+# superFetch saves NZBs as {title}-{16 hex chars} (see safe_nzb_filename in
+# readAndParse.py). Strip that suffix when matching rules; the item keeps
+# its real name when moved.
+NZB_NAME_SUFFIX = re.compile(r"-[0-9a-f]{16}$")
+
+
+def match_name(name):
+    """The rule key for a source item: exact name, else the name without
+    superFetch's NZB identity suffix."""
+    return NZB_NAME_SUFFIX.sub("", name)
 
 
 def _resolve_path(value, base_directory):
@@ -97,6 +116,10 @@ def move_downloads(source_directory, rules, destinations, dry_run=False):
     failed = 0
     for source_item in source_directory.iterdir():
         destination_key = rules.get(source_item.name)
+        if destination_key is None:
+            # Completed folders carry superFetch's NZB identity suffix;
+            # the rules file has the bare release title.
+            destination_key = rules.get(match_name(source_item.name))
         if destination_key is None:
             continue
 
