@@ -86,9 +86,12 @@ def load_rules(downloaded_file):
     return rules
 
 
-def move_downloads(source_directory, rules, destinations):
+def move_downloads(source_directory, rules, destinations, dry_run=False):
     if not source_directory.is_dir():
         raise ValueError(f"Source directory does not exist: {source_directory}")
+
+    verb_move = "WOULD MOVE" if dry_run else "MOVED"
+    verb_fail = "WOULD FAIL" if dry_run else "FAILED"
 
     moved = 0
     failed = 0
@@ -99,29 +102,39 @@ def move_downloads(source_directory, rules, destinations):
 
         destination_directory = destinations.get(destination_key)
         if destination_directory is None:
-            print(
-                f"CATEGORY NOT CONFIGURED item={source_item} "
-                f"category={destination_key!r}"
-            )
+            if dry_run:
+                print(
+                    f"WOULD FAIL item={source_item} "
+                    f"category={destination_key!r}: "
+                    "destination key not configured"
+                )
+            else:
+                print(
+                    f"CATEGORY NOT CONFIGURED item={source_item} "
+                    f"category={destination_key!r}"
+                )
             failed += 1
             continue
 
         destination_item = destination_directory / source_item.name
         if destination_item.exists():
             print(
-                f"FAILED {source_item} -> {destination_item}: "
+                f"{verb_fail} {source_item} -> {destination_item}: "
                 "destination already exists"
             )
             failed += 1
             continue
 
         try:
-            destination_directory.mkdir(parents=True, exist_ok=True)
-            shutil.move(str(source_item), str(destination_item))
-            print(f"MOVED {source_item} -> {destination_item}")
+            if dry_run:
+                print(f"{verb_move} {source_item} -> {destination_item}")
+            else:
+                destination_directory.mkdir(parents=True, exist_ok=True)
+                shutil.move(str(source_item), str(destination_item))
+                print(f"{verb_move} {source_item} -> {destination_item}")
             moved += 1
         except OSError as exc:
-            print(f"FAILED {source_item} -> {destination_item}: {exc}")
+            print(f"{verb_fail} {source_item} -> {destination_item}: {exc}")
             failed += 1
 
     return moved, failed
@@ -141,6 +154,12 @@ def main(argv=None):
         default="move_downloads.json",
         help="JSON configuration file (default: move_downloads.json)",
     )
+    parser.add_argument(
+        "--dry-run",
+        "-n",
+        action="store_true",
+        help="print what would be moved without moving anything",
+    )
     args = parser.parse_args(argv)
     config_path = Path(args.config).expanduser().resolve()
 
@@ -149,13 +168,18 @@ def main(argv=None):
             config_path
         )
         rules = load_rules(downloaded_file)
-        moved, failed = move_downloads(source_directory, rules, destinations)
+        moved, failed = move_downloads(
+            source_directory, rules, destinations, dry_run=args.dry_run
+        )
     except (OSError, ValueError) as exc:
         print(f"Error: {exc}")
         print(f"END {datetime.now():%Y-%m-%d %H:%M:%S}")
         return 1
 
-    print(f"COMPLETE moved={moved} failed={failed}")
+    summary = f"COMPLETE moved={moved} failed={failed}"
+    if args.dry_run:
+        summary += " (dry run)"
+    print(summary)
     print(f"END {datetime.now():%Y-%m-%d %H:%M:%S}")
     return 1 if failed else 0
 
