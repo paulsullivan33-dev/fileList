@@ -142,9 +142,8 @@ class SafetyTests(unittest.TestCase):
                 self.assertNotIn("Private files", page)
                 self.assertNotIn("Private remote", page)
             (self.root / "users.json").write_text("[]", encoding="utf-8")
-            data = self.client.get("/config_status").get_json()
-            self.assertEqual(data["directories"], [])
-            self.assertEqual(data["remote_destinations"], [])
+            # Revocation now denies the whole request and invalidates the cookie.
+            self.assertEqual(self.client.get("/config_status").status_code, 403)
             page = self.client.get("/configuration").get_data(as_text=True)
             self.assertNotIn("/shared-remote", page)
             self.assertNotIn("<strong>Files</strong>", page)

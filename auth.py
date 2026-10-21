@@ -139,6 +139,17 @@ def register(app, directories):
             return None
         if "username" not in session:
             return redirect(url_for("login", next=request.full_path))
+        # Signed cookies prove a past login, not a current grant. Re-read the
+        # account before any route can use cached directory/remote privileges.
+        user = _find_user(app, session["username"])
+        if user is None:
+            session.clear()
+            abort(403)
+        groups = user.get("groups", "")
+        session["groups"] = (
+            [group.strip() for group in groups.split(",") if group.strip()]
+            if isinstance(groups, str) else []
+        )
         request_data = request.get_json(silent=True) if request.is_json else {}
         for key in ("dir", "src_dir", "dest_dir"):
             value = request.values.get(key)

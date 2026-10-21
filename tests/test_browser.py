@@ -1,5 +1,6 @@
 """Regression tests for file-listing recovery."""
 import os
+import json
 import shutil
 import subprocess
 import tempfile
@@ -144,7 +145,10 @@ function alert(message) { calls.push(['alert', message]); }
         ):
             root = Path(temporary) / "files"
             root.mkdir()
-            app = Flask(__name__)
+            (Path(temporary) / 'users.json').write_text(json.dumps([
+                dict(username='tester', password='unused', groups='members')
+            ]), encoding='utf-8')
+            app = Flask(__name__, root_path=temporary)
             app.config.update(TESTING=True)
             directories = [Directory(str(root), "/files", "Files", "members")]
             auth.register(app, directories)
