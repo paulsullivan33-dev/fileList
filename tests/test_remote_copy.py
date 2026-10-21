@@ -38,7 +38,10 @@ class RemoteCopyTests(unittest.TestCase):
         (self.source / "folder").mkdir()
         (self.source / "folder" / "nested.txt").write_text("nested", encoding="utf-8")
         self.directories = [Directory(str(self.source), "/files", "Source", "allowed")]
-        self.app = Flask(__name__)
+        (self.root / "users.json").write_text(json.dumps([
+            dict(username="tester", password="unused", groups="allowed")
+        ]), encoding="utf-8")
+        self.app = Flask(__name__, root_path=str(self.root))
         self.app.config.update(TESTING=True, WTF_CSRF_ENABLED=False)
         auth.register(self.app, self.directories)
         CSRFProtect(self.app)
@@ -168,8 +171,9 @@ class RemoteCopyTests(unittest.TestCase):
         self.assertEqual(self.submit(src_dir="").status_code, 403)
 
     def test_source_permissions_checked(self):
-        with self.client.session_transaction() as session:
-            session["groups"] = ["different"]
+        (self.root / "users.json").write_text(json.dumps([
+            dict(username="tester", password="unused", groups="different")
+        ]), encoding="utf-8")
         self.assertEqual(self.submit().status_code, 403)
 
     def test_remote_permissions_checked_and_hidden(self):
