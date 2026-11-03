@@ -20,7 +20,6 @@ import config_loader
 import archive_ops
 import transfer_preview
 import worker_health
-import category_mappings
 from utils import (
     authorize_job,
     bind_job_selection,
@@ -143,10 +142,6 @@ def register(app, DIRECTORIES):
     @app.route("/worker_status")
     def worker_status():
         return {"success": True, **worker_health.status()}
-
-    @app.route("/category_mappings")
-    def category_mapping_status():
-        return {"success": True, **category_mappings.public_report(category_mappings.check())}
 
     @app.route("/transfer_preview", methods=["POST"])
     def preview_transfer():
@@ -858,7 +853,6 @@ def register(app, DIRECTORIES):
         return (CSS_JS + "<div class='title-row'><h1 class='app-title'>Configuration</h1></div>"
                 "<p class='breadcrumbs'><a href='/'>← Back to files</a></p><h2>Directories</h2><ul>" + directories + "</ul>"
                 + "<h2>Remote destinations</h2>" + remote_error + "<ul>" + remote_rows + "</ul>"
-                + category_mappings.web_controls()
                 + f"<form id='reload-configuration'><input type='hidden' name='csrf_token' value='{generate_csrf()}'><button>Reload configuration</button></form>"
                   "<script>document.getElementById('reload-configuration').onsubmit=async e=>{e.preventDefault();const r=await fetch('/config_reload',{method:'POST',body:new FormData(e.target)});const d=await r.json();if(d.success)location.reload();else alert(d.error||'Reload failed');};</script>")
 

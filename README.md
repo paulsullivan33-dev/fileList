@@ -116,38 +116,10 @@ folders are never created automatically: create the intended folder or restore
 its mount first. Relative roots resolve against the configuration file's folder.
 SSH and rsync are required only when remote destinations are configured.
 
-In **Configuration**, choose **Check category mappings** to compare observed
-superFetch labels against `move_downloads.json` destination keys. The check reads
-the shared download history and configured feed caches without moving files or
-fetching feeds. It identifies missing mappings and reports incomplete coverage
-when histories/caches are missing or unreadable. It uses actual category labels
-(for example `Books > eBook`), not numeric feed IDs. New categories can be detected
-after superFetch refreshes its caches; unseen future labels cannot be predicted.
-
-```bash
-.venv/bin/python move_downloads.py --check-mappings
-.venv/bin/python tools/check_config.py --categories
-```
-
-Set `FILELIST_MOVE_CONFIG` for a non-default mover configuration. Set
-`SUPERFETCH_DATA_DIR` (or pass `--superfetch-data` to the mover check) for the
-producer's history/XML folder; otherwise the sibling superFetch folder is used,
-matching superFetch's default. `SUPERFETCH_SOURCE` locates its feed catalog when
-the repository is elsewhere. Missing mover configuration is reported as
-**not_configured**, and is never created automatically. Category checks do not
-block normal application startup unless explicitly requested with `--categories`.
-
-Download routing is checked against the actual superFetch producer, including
-sanitized names, byte truncation, category-specific hashes, and history parsing:
-
-```bash
-.venv/bin/python tools/check_superfetch.py --superfetch ../superFetch
-```
-
-The regression suite checks the sibling superFetch repository when present; set
-`SUPERFETCH_SOURCE` to another `readAndParse.py` path if needed. CI checks out
-superFetch's default branch and runs this contract check on every push and PR.
-The checker loads only the naming/history functions and never runs downloads.
+Download filing is handled by superFetch's own mover: superFetch files its
+completed downloads into their destination folders, and fileList simply
+displays those folders. fileList has no knowledge of superFetch's
+configuration, download history, or feed data.
 
 A multi-directory, browser-based file manager built with Flask. Manage your files with a clean UI featuring dark mode, archive handling, file previews, and robust path validation — all from a lightweight Python web server.
 
@@ -191,22 +163,6 @@ external editor require running the backup command yourself. Existing configurat
 files are still preserved by the release installer.
 After restoring directory settings, use **Reload configuration** or restart the
 application so its active folder list reflects the restored file.
-
-The standalone `move_downloads.py` uses the worker's atomic rename, staged copy,
-and free-space checks. Existing names (including dangling links) are never replaced.
-It requires the same Windows/Linux atomic-rename support as worker file operations.
-Same-drive moves rename without reserving space for a second copy; cross-drive
-moves publish a complete staged copy before removing the source. Sources should
-remain unchanged during copying, as with worker transfers.
-
-Each source folder has a `.filelist-move-state` recovery journal and mover lock.
-Only one standalone mover can use that source at a time; its work never enters the
-web application's queue. Rerunning the command cleans recognized interrupted
-partials and retries unfinished source items. Completed items are already absent
-from the source, so they are not repeated. If a destination was published but the
-source remains, both are preserved and the output asks for manual review. Completed
-journal entries are kept for 30 days. `--dry-run` creates no recovery or destination
-files. Interrupted commands can therefore be rerun without overwriting prior data.
 
 Each directory in `directories.json` needs a display `name` and a `group`.
 An optional unique `id` (letters, numbers, underscores, and hyphens) gives it an

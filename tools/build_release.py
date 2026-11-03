@@ -8,18 +8,18 @@ from zipfile import ZipFile, ZipInfo, ZIP_DEFLATED
 
 ROOT = Path(__file__).resolve().parent.parent
 APPLICATION_FILES = (
-    "actions.py", "archive_ops.py", "app.py", "auth.py", "browser.py", "config_loader.py", "config_backups.py", "download_moves.py", "folder_listing.py",
-    "job_store.py", "job_worker.py", "manage_user.py", "move_downloads.py", "operation_log.py",
-    "remote_copy.py", "styles.py", "transfer_preview.py", "uploads.py", "utils.py", "worker_health.py", "category_mappings.py", "requirements.txt",
+    "actions.py", "archive_ops.py", "app.py", "auth.py", "browser.py", "config_loader.py", "config_backups.py", "folder_listing.py",
+    "job_store.py", "job_worker.py", "manage_user.py", "operation_log.py",
+    "remote_copy.py", "styles.py", "transfer_preview.py", "uploads.py", "utils.py", "worker_health.py", "requirements.txt",
     "start", "run.sh", "stop.sh", "README.md", "directories.example.json", "users.example.json",
     "remote_destinations.example.json", "external_sites.example.json",
-    "move_downloads.example.json", "tests/test_remote_copy.py", "tests/test_browser.py",
+    "tests/test_remote_copy.py", "tests/test_browser.py",
     "tests/test_safety.py", "tests/test_config_check.py", "tests/test_convert.py", "tests/test_archives.py",
-    "tests/test_job_identity.py", "tests/test_move_downloads.py", "tests/test_transfers.py",
-    "tests/test_uploads.py", "tests/test_operation_log.py", "tests/test_superfetch_contract.py",
+    "tests/test_job_identity.py", "tests/test_transfers.py",
+    "tests/test_uploads.py", "tests/test_operation_log.py",
     "tests/test_transfer_preview.py", "tests/test_linux_integration.py", "tests/test_pagination.py",
-    "tests/test_queue.py", "tests/test_worker_health.py", "tests/test_category_mappings.py", "tests/test_config_backups.py",
-    "tests/test_download_moves.py", "tools/check_config.py", "tools/check_superfetch.py", "tools/config_backup.py",
+    "tests/test_queue.py", "tests/test_worker_health.py", "tests/test_config_backups.py",
+    "tools/check_config.py", "tools/config_backup.py",
 )
 
 

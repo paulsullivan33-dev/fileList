@@ -172,19 +172,12 @@ def require_startup(config=None, users=None):
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--ssh", action="store_true", help="Verify passwordless SSH, remote write access, and rsync")
-    parser.add_argument("--categories", action="store_true", help="Also check observed superFetch category destination mappings")
     args = parser.parse_args(argv)
     messages, errors = validate_startup(verify_ssh=args.ssh)
     for message in messages:
         print("OK:", message)
     for error in errors:
         print("ERROR:", error)
-    if args.categories:
-        import category_mappings
-        report = category_mappings.check()
-        category_mappings.print_report(report)
-        if report["status"] != "ok":
-            errors.append("Download category mappings need attention.")
     if errors:
         print(f"Configuration check failed with {len(errors)} error(s).")
         return 1

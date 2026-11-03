@@ -63,16 +63,16 @@ and copy the desired backup's contents over the installation, then restart.
 
 Use the same installer command with a new target directory. Then configure:
 
-Five example JSON files are included under `application/` in the ZIP and are
+Four example JSON files are included under `application/` in the ZIP and are
 installed alongside the application: `directories.example.json`,
-`remote_destinations.example.json`, `users.example.json`,
-`external_sites.example.json`, and `move_downloads.example.json`.
+`remote_destinations.example.json`, `users.example.json`, and
+`external_sites.example.json`.
 All filesystem examples use Linux paths. For a new server, copy the directory
 and remote examples to the corresponding filenames without `.example`, then
 edit the paths, hosts, URLs and groups. The external-sites list is optional.
 The users example illustrates the format only; use `manage_user.py` below to
 create a real password hash. Do not copy example values over existing settings
-when upgrading. The download-moving example is for the optional CLI utility.
+when upgrading.
 
 1. `directories.json`: use `directories.example.json` as a guide. Configure actual
    local storage paths and the corresponding file-serving URLs on this server.
