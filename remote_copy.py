@@ -7,9 +7,10 @@ import shlex
 import subprocess
 import tempfile
 import time
+import worker_health
 from pathlib import Path
 
-from utils import is_safe_path, is_safe_segment, remote_minimum_free_bytes, safe_dir_index, safe_join, user_can_access_directory
+from utils import is_safe_path, is_safe_segment, remote_minimum_free_bytes, safe_dir_index, safe_join, user_can_access_directory, transfer_item, resolve_job_directory
 
 
 RSYNC_PROGRESS = re.compile(r"(?:^|[\r\n])\s*([0-9][0-9,]*)\s+\d+%")
@@ -48,7 +49,7 @@ def load_destinations():
     return result
 
 
-def validate_sources(index, path, names, directories, groups):
+def validate_sources(index, path, names, directories, groups, job_path=None):
     index = safe_dir_index(index, directories, default=-1)
     if index is None or not user_can_access_directory(directories[index], groups):
         raise PermissionError("You cannot access the source directory.")
@@ -56,8 +57,11 @@ def validate_sources(index, path, names, directories, groups):
         raise ValueError("Invalid source selection.")
     sources = []
     for name in names:
+        if job_path is not None:
+            import job_store
+            job_store.start_item(job_path, name)
         if not isinstance(name, str) or not is_safe_segment(name) or "/" in name or name == ".":
-            raise ValueError("Invalid source name.")
+            raise ValueError(f"Invalid source name: {name!r}")
         source = safe_join(directories[index].root, path, name)
         if source is None or not (os.path.isfile(source) or os.path.isdir(source)):
             raise ValueError(f"Invalid or missing source: {name}")
@@ -116,8 +120,28 @@ def list_directories(destination, subpath=""):
     return {"path": subpath, "directories": names}
 
 
+def preview_destination(destination, names):
+    checks = [_containment_check(destination), f"test -d {shlex.quote(destination['path'])}"]
+    for index, name in enumerate(names):
+        target = shlex.quote(posixpath.join(destination["path"], name))
+        checks.append(f"if test -e {target} || test -L {target}; then printf '%s\\n' {index}; fi")
+    try:
+        result = subprocess.run(ssh_command(destination) + [destination["host"], " && ".join(checks)],
+                                stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                text=True, timeout=20, check=False)
+    except subprocess.TimeoutExpired as error:
+        raise RuntimeError("Remote preview timed out. Check the destination and try again.") from error
+    if result.returncode:
+        raise RuntimeError((result.stderr or "Cannot check the remote destination.").strip()[-500:])
+    indices = result.stdout.splitlines()
+    if any(not value.isdigit() or int(value) >= len(names) for value in indices):
+        raise ValueError("Unexpected response while checking remote filenames.")
+    return {names[int(value)] for value in indices}
+
+
 def selector_html(index, path, names, local_tabs=""):
     import html
+    import transfer_preview
     from flask import session
     from flask_wtf.csrf import generate_csrf
 
@@ -144,14 +168,14 @@ def selector_html(index, path, names, local_tabs=""):
                   ("remote_id", destination["id"])] + [("name", name) for name in names]
         panels.append(
             f"<div id='{escape(panel_id)}' class='remote-destination-panel' hidden>"
-            "<form method='post' action='/remote_copy'>"
+            "<form method='post' action='/remote_copy' data-preview-operation='copy'>"
             f"<p><strong>{escape(destination['name'])}</strong> · {escape(host)}</p>"
             f"<p class='destination-path'>{escape(destination['path'])}</p>"
             f"<div class='remote-browser' data-remote-id='{escape(destination['id'])}'><button type='button' onclick='browseRemote(this, \"\")'>Browse remote folders</button><span class='remote-path'></span><ul></ul></div>"
             "<p>Copy here and keep the local original.</p>"
             + "".join(f"<input type='hidden' name='{key}' value='{escape(value)}'>" for key, value in fields)
             + "<input type='hidden' name='remote_subpath' value=''>"
-            + "<button class='move-here-btn' type='submit'>Copy here</button></form></div>"
+            + "<button class='move-here-btn' type='submit' disabled>Copy here</button></form></div>"
         )
     return (
         "<nav class='destination-tabs' aria-label='Local destinations and Remote servers'>"
@@ -166,20 +190,28 @@ function selectRemoteDestination(button) {
         tab.setAttribute('aria-expanded', tab === button ? 'true' : 'false');
     });
     document.getElementById('local-destination-panel').hidden = true;
+    const form = document.getElementById(button.getAttribute('aria-controls')).querySelector('form');
+    refreshTransferPreview(form);
 }
 async function browseRemote(button, path) {
     const box = button.closest('.remote-browser');
     const form = box.closest('form');
+    invalidateTransferPreview(form);
+    try {
     const response = await fetch('/remote_directories?remote_id=' + encodeURIComponent(box.dataset.remoteId) + '&path=' + encodeURIComponent(path));
     const data = await response.json().catch(() => ({}));
-    if (!response.ok || !data.success) { alert(data.error || 'Could not list remote folders'); return; }
+    if (!response.ok || !data.success) throw new Error(data.error || 'Could not list remote folders');
     form.querySelector('[name=remote_subpath]').value = data.path;
     box.querySelector('.remote-path').textContent = data.path ? ' / ' + data.path : ' /';
     const list = box.querySelector('ul'); list.replaceChildren();
     if (data.path) { const up = document.createElement('button'); up.type = 'button'; up.textContent = '↑ Up'; up.onclick = () => browseRemote(up, data.path.split('/').slice(0, -1).join('/')); list.appendChild(up); }
     for (const name of data.directories) { const item = document.createElement('button'); item.type = 'button'; item.textContent = '📁 ' + name; item.onclick = () => browseRemote(item, data.path ? data.path + '/' + name : name); list.appendChild(item); }
+    refreshTransferPreview(form);
+    } catch (error) { form.querySelector('.transfer-preview').textContent = error.message || 'Could not list remote folders. Check again.'; }
 }
 </script>"""
+        + transfer_preview.scripts()
+        + "<noscript><p>Turn on JavaScript to check the destination before starting a transfer.</p></noscript>"
     )
 
 
@@ -223,8 +255,10 @@ def _measure(path):
         return os.path.getsize(path)
     total = 0
     for root, directories, files in os.walk(path, followlinks=False):
+        worker_health.checkpoint()
         directories[:] = [name for name in directories if not os.path.islink(os.path.join(root, name))]
         for name in files:
+            worker_health.checkpoint()
             candidate = os.path.join(root, name)
             if not os.path.islink(candidate):
                 total += os.path.getsize(candidate)
@@ -290,59 +324,68 @@ def run_job(job, job_path, directories, progress_class, check_cancel):
     user = next((u for u in users if u.get("username") == job["owner"]), None)
     groups = [g.strip() for g in user.get("groups", "").split(",") if g.strip()] if user else []
     info = job["source"]
-    _, sources = validate_sources(info.get("directory_index"), info.get("path", ""), info.get("names"), directories, groups)
+    _, sources = validate_sources(resolve_job_directory(info, directories), info.get("path", ""), info.get("names"), directories, groups, job_path)
+    job_store.update(job_path, current_name=None)
     configured = destination_for(job["destination"].get("remote_id"), groups)
     submitted = job["destination"].get("configuration") or {}
     destination = with_subpath(configured, submitted.get("subpath", ""))
     if destination != submitted:
         raise ValueError("Remote configuration changed since submission; submit the copy again.")
-    progress = progress_class(job, job_path, sum(_measure(source) for _, source in sources))
+    total = 0
+    for name, source in sources:
+        job_store.start_item(job_path, name)
+        with transfer_item(name):
+            total += _measure(source)
+    job_store.update(job_path, current_name=None)
+    progress = progress_class(job, job_path, total)
     job_store.update(job_path, progress_unit="bytes")
     ssh = ssh_command(destination)
     check = lambda: check_cancel(job["job_id"])
     quote = shlex.quote
     for ordinal, (name, source) in enumerate(sources):
-        check()
-        item_total = _measure(source)
-        item_completed = 0
+        job_store.start_item(job_path, name)
+        with transfer_item(name):
+            check()
+            item_total = _measure(source)
+            item_completed = 0
 
-        def report_progress(transferred):
-            nonlocal item_completed
-            current = min(max(transferred, 0), item_total)
-            if current > item_completed:
-                progress.add(current - item_completed)
-                item_completed = current
+            def report_progress(transferred):
+                nonlocal item_completed
+                current = min(max(transferred, 0), item_total)
+                if current > item_completed:
+                    progress.add(current - item_completed)
+                    item_completed = current
 
-        target = posixpath.join(destination["path"], name)
-        stage = posixpath.join(destination["path"], f".filelist-{job['job_id']}-{ordinal}.partial")
-        # The staging directory is unique and created exclusively. No remote deletion
-        # is attempted on failure: interrupted work remains recognizable for cleanup.
-        prepare = (
-            _containment_check(destination) + " && "
-            f"test -d {quote(destination['path'])} && "
-            f"available=$(df -Pk -- {quote(destination['path'])} | awk 'NR == 2 {{print $4 * 1024}}') && "
-            f"test -n \"$available\" && test \"$available\" -ge {item_total + remote_minimum_free_bytes()} || "
-            "{ echo 'Not enough free disk space on remote destination' >&2; exit 1; } && "
-            f"if test -e {quote(target)} || test -L {quote(target)}; then "
-            "echo 'Destination already exists' >&2; exit 1; fi && "
-            f"mkdir -- {quote(stage)}"
-        )
-        run_process(ssh + [destination["host"], prepare], check)
-        job_store.update(job_path, remote_partial_path=stage)
-        # --info=progress2 gives byte progress for the job status UI. --protect-args
-        # preserves spaces/shell characters; -l preserves symlinks inside directories.
-        run_rsync(["rsync", "-rlpt", "--info=progress2", "--protect-args", "-e", shlex.join(ssh), "--",
-                   source, f"{destination['host']}:{stage}/"], check, report_progress)
-        check()
-        staged_item = posixpath.join(stage, os.path.basename(source))
-        publish = (
-            _containment_check(destination) + " && "
-            f"mv -T -n -- {quote(staged_item)} {quote(target)} && "
-            f"if test -e {quote(staged_item)} || test -L {quote(staged_item)}; then "
-            "echo 'Destination already exists; staged copy retained' >&2; exit 1; fi && "
-            f"rmdir -- {quote(stage)}"
-        )
-        run_process(ssh + [destination["host"], publish], check)
-        job_store.complete_item(job_path, name)
-        job_store.update(job_path, remote_partial_path=None)
-        progress.add(item_total - item_completed, force=True)
+            target = posixpath.join(destination["path"], name)
+            stage = posixpath.join(destination["path"], f".filelist-{job['job_id']}-{ordinal}.partial")
+            # The staging directory is unique and created exclusively. No remote deletion
+            # is attempted on failure: interrupted work remains recognizable for cleanup.
+            prepare = (
+                _containment_check(destination) + " && "
+                f"test -d {quote(destination['path'])} && "
+                f"available=$(df -Pk -- {quote(destination['path'])} | awk 'NR == 2 {{print $4 * 1024}}') && "
+                f"test -n \"$available\" && test \"$available\" -ge {item_total + remote_minimum_free_bytes()} || "
+                "{ echo 'Not enough free disk space on remote destination' >&2; exit 1; } && "
+                f"if test -e {quote(target)} || test -L {quote(target)}; then "
+                "echo 'Destination already exists' >&2; exit 1; fi && "
+                f"mkdir -- {quote(stage)}"
+            )
+            run_process(ssh + [destination["host"], prepare], check)
+            job_store.update(job_path, remote_partial_path=stage)
+            # --info=progress2 gives byte progress for the job status UI. --protect-args
+            # preserves spaces/shell characters; -l preserves symlinks inside directories.
+            run_rsync(["rsync", "-rlpt", "--info=progress2", "--protect-args", "-e", shlex.join(ssh), "--",
+                       source, f"{destination['host']}:{stage}/"], check, report_progress)
+            check()
+            staged_item = posixpath.join(stage, os.path.basename(source))
+            publish = (
+                _containment_check(destination) + " && "
+                f"mv -T -n -- {quote(staged_item)} {quote(target)} && "
+                f"if test -e {quote(staged_item)} || test -L {quote(staged_item)}; then "
+                "echo 'Destination already exists; staged copy retained' >&2; exit 1; fi && "
+                f"rmdir -- {quote(stage)}"
+            )
+            run_process(ssh + [destination["host"], publish], check)
+            job_store.complete_item(job_path, name)
+            job_store.update(job_path, remote_partial_path=None)
+            progress.add(item_total - item_completed, force=True)

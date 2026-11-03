@@ -7,6 +7,8 @@ import zipfile
 import tarfile
 import stat
 import urllib.parse
+import sqlite3
+import operation_log
 
 from flask import request, redirect, abort, jsonify, session
 from flask_wtf.csrf import generate_csrf
@@ -15,8 +17,13 @@ from styles import CSS_JS
 import job_store
 import remote_copy
 import config_loader
+import archive_ops
+import transfer_preview
+import worker_health
+import category_mappings
 from utils import (
     authorize_job,
+    bind_job_selection,
     current_user_groups,
     is_safe_path,
     is_safe_segment,
@@ -64,14 +71,25 @@ def _allowed_directory_indices(directories):
     ]
 
 
-def _enqueue_job(operation, source, destination):
+def _enqueue_job(operation, source, destination, directories):
     owner = session.get("username")
-    per_user_limit = int(os.environ.get("JOB_MAX_PENDING_PER_USER", "20"))
-    if job_store.pending_count(owner) >= per_user_limit:
-        raise RuntimeError(f"You already have {per_user_limit} pending jobs.")
-    if job_store.has_active_destination(destination):
-        raise RuntimeError("A job for that destination is already pending or running.")
-    return job_store.create(operation, owner, source, destination)
+    try:
+        source = bind_job_selection(source, directories)
+        if operation in {"copy", "move", "convert"}:
+            destination = bind_job_selection(destination, directories)
+        expected_preview = request.form.get("preview_signature")
+        if expected_preview and expected_preview != transfer_preview.signature(operation, source, destination):
+            raise ValueError("Folder configuration changed since the preview. Reopen the destination and check again.")
+        per_user_limit = int(os.environ.get("JOB_MAX_PENDING_PER_USER", "20"))
+        if job_store.pending_count(owner) >= per_user_limit:
+            raise RuntimeError(f"You already have {per_user_limit} pending jobs.")
+        if job_store.has_active_destination(destination):
+            raise RuntimeError("A job for that destination is already pending or running.")
+        return job_store.create(operation, owner, source, destination)
+    except (OSError, RuntimeError, ValueError) as error:
+        operation_log.record_job({"owner": owner, "operation": operation, "source": source, "destination": destination},
+                                 "failed", detail=f"Could not queue operation: {error}")
+        raise
 
 
 def _queued_job_response(job, dir_index, path):
@@ -103,18 +121,84 @@ def _redirect_listing(dir_index, path):
 
 def _build_move_here_link(src_index, src_path, src_name, dest_index, dest_path):
     return (
-        "<form method='post' action='/move_do'>"
+        "<form method='post' action='/move_do' data-preview-operation='move'>"
         f"<input type='hidden' name='csrf_token' value='{generate_csrf()}'>"
         f"<input type='hidden' name='src_dir' value='{src_index}'>"
         f"<input type='hidden' name='src_path' value='{html.escape(src_path, quote=True)}'>"
         f"<input type='hidden' name='src_name' value='{html.escape(src_name, quote=True)}'>"
         f"<input type='hidden' name='dest_dir' value='{dest_index}'>"
         f"<input type='hidden' name='dest_path' value='{html.escape(dest_path, quote=True)}'>"
-        "<button class='move-here-btn' type='submit'>📥 Move Here</button></form>"
+        "<button class='move-here-btn' type='submit' disabled>📥 Move Here</button></form>"
     )
 
 
 def register(app, DIRECTORIES):
+
+    def enqueue_job(operation, source, destination):
+        return _enqueue_job(operation, source, destination, DIRECTORIES)
+
+    def log_operation(operation, outcome, source="", destination="", item="", detail=""):
+        operation_log.record(session.get("username"), operation, outcome, source, destination, item, detail=detail)
+
+    @app.route("/worker_status")
+    def worker_status():
+        return {"success": True, **worker_health.status()}
+
+    @app.route("/category_mappings")
+    def category_mapping_status():
+        return {"success": True, **category_mappings.public_report(category_mappings.check())}
+
+    @app.route("/transfer_preview", methods=["POST"])
+    def preview_transfer():
+        values = request.get_json(silent=True) if request.is_json else request.form
+        values = values or {}
+        names = values.get("names") if request.is_json else request.form.getlist("name")
+        if not names and values.get("src_name"):
+            names = [values.get("src_name")]
+        try:
+            preview = transfer_preview.plan(
+                values.get("operation", "copy"), values.get("src_dir"), values.get("src_path", ""), names,
+                DIRECTORIES, session.get("groups", []), values.get("dest_dir"), values.get("dest_path", ""),
+                values.get("remote_id", ""), values.get("remote_subpath", ""),
+            )
+        except PermissionError as error:
+            return {"success": False, "error": str(error)}, 403
+        except (OSError, RuntimeError, ValueError) as error:
+            return {"success": False, "error": str(error)}, 400
+        return {"success": True, **preview}
+
+    @app.route("/operations")
+    def operation_history():
+        query = request.args.get("q", "").strip()
+        operation = request.args.get("operation", "").strip()
+        outcome = request.args.get("outcome", "").strip()
+        try:
+            page = max(1, int(request.args.get("page", "1")))
+        except ValueError:
+            page = 1
+        try:
+            records = operation_log.search(session.get("username"), query, operation, outcome, limit=51, offset=(page - 1) * 50)
+        except (OSError, sqlite3.Error) as error:
+            app.logger.warning("Operation log unavailable: %s", error)
+            return CSS_JS + "<h1>Operation log</h1><p>The operation log is unavailable. Check the application log for details.</p>", 503
+        def page_link(number, label):
+            url = "/operations?" + urllib.parse.urlencode({"q": query, "operation": operation, "outcome": outcome, "page": number})
+            return f"<a href='{html.escape(url, quote=True)}'>{label}</a> "
+        navigation = page_link(page - 1, "Previous") if page > 1 else ""
+        if len(records) > 50:
+            navigation += page_link(page + 1, "Next")
+        rows = "".join("<tr>" + "".join(f"<td>{html.escape(str(record[key]))}</td>"
+                      for key in ("timestamp", "username", "operation", "outcome", "item", "source", "destination", "detail", "job_id")) + "</tr>"
+                      for record in records[:50]) or "<tr><td colspan='9'>No matching operations.</td></tr>"
+        fields = "".join(f"<label>{label} <input name='{key}' value='{html.escape(value, quote=True)}'></label> "
+                         for key, label, value in (("q", "Search files, folders, errors or job IDs", query),
+                                                  ("operation", "Operation", operation), ("outcome", "Outcome", outcome)))
+        return (CSS_JS + "<h1>Operation log</h1><p><a href='/'>Back to files</a> · <a href='/jobs'>Recent transfers</a></p>"
+                + "<form method='get'>" + fields + "<button>Search</button></form>"
+                + "<p>Outcomes: queued, running, complete, failed, cancelled. Times are UTC.</p>"
+                + navigation + "<table class='table'><thead><tr>"
+                + "".join(f"<th>{label}</th>" for label in ("When", "User", "Operation", "Outcome", "Item", "Source", "Destination", "Details", "Job ID"))
+                + "</tr></thead><tbody>" + rows + "</tbody></table>" + navigation)
 
     @app.route("/remote_copy", methods=["POST"])
     def remote_copy_items():
@@ -129,7 +213,7 @@ def register(app, DIRECTORIES):
                 request.form.get("remote_id"), session.get("groups", []),
             )
             destination = remote_copy.with_subpath(destination, request.form.get("remote_subpath", ""))
-            job = _enqueue_job(
+            job = enqueue_job(
                 "remote_copy",
                 {"directory_index": src_index, "path": src_path, "names": names},
                 {"remote_id": destination["id"], "configuration": destination, "names": names},
@@ -178,8 +262,10 @@ def register(app, DIRECTORIES):
         except FileNotFoundError:
             pass
         except OSError as e:
+            log_operation("delete", "failed", source=full, item=name, detail=str(e))
             return warn_and_redirect(CSS_JS, f"Delete failed: {e}", dir_index, path)
 
+        log_operation("delete", "complete", source=full, item=name)
         return _redirect_listing(dir_index, path)
 
     # ---------------------------------------------------------
@@ -212,10 +298,13 @@ def register(app, DIRECTORIES):
                 else:
                     os.remove(target)
                 deleted += 1
+                log_operation("delete", "complete", source=target, item=n)
             except FileNotFoundError:
                 deleted += 1  # already gone, count as success
+                log_operation("delete", "complete", source=target, item=n, detail="Already absent")
             except OSError as e:
                 errors.append({"name": n, "error": str(e)})
+                log_operation("delete", "failed", source=target, item=n, detail=str(e))
 
         return jsonify({
             "success": not errors,
@@ -246,10 +335,13 @@ def register(app, DIRECTORIES):
         try:
             os.makedirs(new_dir, exist_ok=False)
         except FileExistsError:
+            log_operation("mkdir", "failed", destination=new_dir, item=name, detail="Folder already exists")
             return jsonify({"success": False, "error": "Folder already exists."})
         except OSError as e:
+            log_operation("mkdir", "failed", destination=new_dir, item=name, detail=str(e))
             return jsonify({"success": False, "error": str(e)})
 
+        log_operation("mkdir", "complete", destination=new_dir, item=name)
         return jsonify({"success": True})
 
     # ---------------------------------------------------------
@@ -329,14 +421,14 @@ def register(app, DIRECTORIES):
             )
         )
         move_here_html = (
-            "<form method='post' action='/bulk_move_do'>"
+            "<form method='post' action='/bulk_move_do' data-preview-operation='move'>"
             + hidden
-            + f"<button class='move-here-btn' type='submit'>📥 Move {len(names)} Item(s) Here</button>"
+            + f"<button class='move-here-btn' type='submit' disabled>📥 Move {len(names)} Item(s) Here</button>"
             + "</form>"
         )
         folders_html = "<ul>" + "".join(
             f"<li><a href='{_html.escape(picker_url(f'{dest_path}/{name}'.strip('/')), quote=True)}'>"
-            f"{_html.escape(name)}</a></li>"
+            f"📁 {_html.escape(name)}</a></li>"
             for name in entries
         ) + "</ul>"
 
@@ -348,8 +440,9 @@ def register(app, DIRECTORIES):
             + remote_copy.selector_html(src_index, src_path, names, roots_html)
             + "<div id='local-destination-panel'>"
             + f"<div class='breadcrumbs'>{breadcrumb_html}</div><br>"
-            + f"<div class='move-here-top'>{move_here_html}</div><br>"
+            + "<div>Folders in this destination:</div>"
             + folders_html
+            + f"<div class='move-here-top'>{move_here_html}</div>"
             + "</div></div>"
         )
 
@@ -391,12 +484,12 @@ def register(app, DIRECTORIES):
             if os.path.lexists(target):
                 return warn_and_redirect(CSS_JS, f"Destination already exists: {name}", dest_index, dest_path)
         try:
-            job = _enqueue_job(
+            job = enqueue_job(
                 "move",
                 {"directory_index": src_index, "path": src_path, "names": names},
                 {"directory_index": dest_index, "path": dest_path, "names": names},
             )
-        except (OSError, RuntimeError) as e:
+        except (OSError, RuntimeError, ValueError) as e:
             return warn_and_redirect(CSS_JS, f"Could not queue move: {e}", src_index, src_path)
         return _queued_job_response(job, dest_index, dest_path)
 
@@ -421,7 +514,7 @@ def register(app, DIRECTORIES):
         dest_path = values.get("dest_path", src_path)
 
         if not is_safe_path(src_path) or not is_safe_segment(src_name):
-            return warn_and_redirect(CSS_JS, "Invalid source path.", src_index, "")
+            return warn_and_redirect(CSS_JS, f"Invalid source path or filename: {src_path!r} / {src_name!r}.", src_index, "")
         if not is_safe_path(dest_path):
             return warn_and_redirect(CSS_JS, "Invalid destination path.",
                                      dest_index, "")
@@ -429,8 +522,8 @@ def register(app, DIRECTORIES):
         src_root, _ = DIRECTORIES[src_index]
         dest_root, _ = DIRECTORIES[dest_index]
 
-        src_full = safe_join(src_root, src_path, urllib.parse.unquote(src_name))
-        dest_full = safe_join(dest_root, dest_path, urllib.parse.unquote(src_name))
+        src_full = safe_join(src_root, src_path, src_name)
+        dest_full = safe_join(dest_root, dest_path, src_name)
         if src_full is None or dest_full is None:
             return warn_and_redirect(CSS_JS, "Path escapes root.", src_index, src_path)
 
@@ -474,14 +567,14 @@ def register(app, DIRECTORIES):
                 for entry in entries
             ) + "</ul>"
             form_html = (
-                "<form method='post' action='/copy'>"
+                "<form method='post' action='/copy' data-preview-operation='copy'>"
                 f"<input type='hidden' name='csrf_token' value='{generate_csrf()}'>"
                 f"<input type='hidden' name='src_dir' value='{src_index}'>"
                 f"<input type='hidden' name='src_path' value='{html.escape(src_path, quote=True)}'>"
                 f"<input type='hidden' name='src_name' value='{html.escape(src_name, quote=True)}'>"
                 f"<input type='hidden' name='dest_dir' value='{dest_index}'>"
                 f"<input type='hidden' name='dest_path' value='{html.escape(dest_path, quote=True)}'>"
-                "<button class='move-here-btn' type='submit'>📋 Copy Here</button></form>"
+                "<button class='move-here-btn' type='submit' disabled>📋 Copy Here</button></form>"
             )
             return (
                 CSS_JS
@@ -501,18 +594,20 @@ def register(app, DIRECTORIES):
             )
 
         if not os.path.lexists(src_full):
-            return warn_and_redirect(CSS_JS, "Source does not exist.", src_index, src_path)
+            log_operation("copy", "failed", src_full, dest_full, src_name, "Source does not exist")
+            return warn_and_redirect(CSS_JS, f"Source does not exist: {src_name!r}.", src_index, src_path)
         if os.path.lexists(dest_full):
-            return warn_and_redirect(CSS_JS, "Destination already exists.", dest_index, dest_path)
+            log_operation("copy", "failed", src_full, dest_full, src_name, "Destination already exists")
+            return warn_and_redirect(CSS_JS, f"Destination already exists: {src_name!r}.", dest_index, dest_path)
         try:
-            job = _enqueue_job(
+            job = enqueue_job(
                 "copy",
                 {"directory_index": src_index, "path": src_path,
-                 "names": [urllib.parse.unquote(src_name)]},
+                 "names": [src_name]},
                 {"directory_index": dest_index, "path": dest_path,
-                 "names": [urllib.parse.unquote(src_name)]},
+                 "names": [src_name]},
             )
-        except (OSError, RuntimeError) as e:
+        except (OSError, RuntimeError, ValueError) as e:
             return warn_and_redirect(CSS_JS, f"Could not queue copy: {e}", src_index, src_path)
         return _queued_job_response(job, dest_index, dest_path)
 
@@ -542,14 +637,18 @@ def register(app, DIRECTORIES):
             return {"success": False, "error": "Path escapes root."}
 
         if not os.path.exists(old_full):
+            log_operation("rename", "failed", old_full, new_full, old, "Source does not exist")
             return {"success": False, "error": "Source does not exist."}
         if os.path.exists(new_full):
+            log_operation("rename", "failed", old_full, new_full, old, "Destination already exists")
             return {"success": False, "error": "Destination already exists."}
 
         try:
             os.rename(old_full, new_full)
         except OSError as e:
+            log_operation("rename", "failed", old_full, new_full, old, str(e))
             return {"success": False, "error": str(e)}
+        log_operation("rename", "complete", old_full, new_full, old)
         return {"success": True}
 
     # ---------------------------------------------------------
@@ -568,8 +667,8 @@ def register(app, DIRECTORIES):
             return {"success": False, "error": "Invalid name or path."}, 400
 
         extension = os.path.splitext(name)[1].lower()
-        if extension not in {".avi", ".mpg", ".mpeg"}:
-            return {"success": False, "error": "Only AVI and MPG files can be converted."}, 400
+        if extension not in {".avi", ".mpg", ".mpeg", ".mkv"}:
+            return {"success": False, "error": "Only AVI, MPG and MKV files can be converted."}, 400
 
         root_dir, _ = DIRECTORIES[dir_index]
         source = safe_join(root_dir, path, name)
@@ -585,12 +684,12 @@ def register(app, DIRECTORIES):
         except OSError as error:
             return {"success": False, "error": str(error)}, 507
         try:
-            job = _enqueue_job(
+            job = enqueue_job(
                 "convert",
                 {"directory_index": dir_index, "path": path, "names": [name]},
                 {"directory_index": dir_index, "path": path, "names": [output_name]},
             )
-        except (OSError, RuntimeError) as e:
+        except (OSError, RuntimeError, ValueError) as e:
             return {"success": False, "error": f"Could not queue conversion: {e}"}, 503
         return {
             "success": True,
@@ -602,13 +701,31 @@ def register(app, DIRECTORIES):
     @app.route("/jobs", endpoint="job_history")
     def job_history():
         jobs = job_store.history(session.get("username"))
+        queue = job_store.queue_snapshot(session.get("username"))
         rows = []
         for job in jobs:
+            summary = job_store.item_summary(job)
+            position = queue.get(job["job_id"], {})
+            status = str(job.get("status", ""))
+            if status == "pending" and position:
+                status = f"Queued #{position['queue_position']} · {position['jobs_ahead']} job(s) ahead"
+            cancel_requested = job_store.cancellation_requested(job["job_id"])
+            if cancel_requested and job.get("status") == "running":
+                status += " · Cancellation requested"
             source = job.get("source", {})
             names = source.get("names", []) if isinstance(source, dict) else []
             item_label = ", ".join(str(name) for name in names[:3])
             if len(names) > 3:
                 item_label += f" and {len(names) - 3} more"
+            item_details = ""
+            for label, key in (("Completed", "completed_names"), ("Failed", "failed_names"), ("Remaining", "remaining_names")):
+                items = summary[key]
+                item_details += (
+                    f"<details><summary>{label} ({len(items)})</summary><ul>"
+                    + "".join(f"<li>{html.escape(str(name))}</li>" for name in items) + "</ul></details>"
+                )
+            if summary["current_name"]:
+                item_details += f"<p>In progress: {html.escape(str(summary['current_name']))}</p>"
             total = job.get("bytes_total", 0)
             completed = job.get("bytes_completed", 0)
             transfer = f"{format_size(completed)} / {format_size(total)}" if total else "—"
@@ -620,17 +737,23 @@ def register(app, DIRECTORIES):
                 transfer += f" · about {int(eta)}s left"
             when = job.get("finished_at") or job.get("started_at") or job.get("created_at") or ""
             detail = job.get("error") or job.get("remote_partial_path") or ""
+            if summary["requires_resubmit"]:
+                detail += " Select the remaining files and start a new transfer; this older transfer cannot be retried safely."
             rows.append(
                 "<tr>"
                 f"<td>{html.escape(str(job.get('operation', '')))}</td>"
-                f"<td>{html.escape(str(job.get('status', '')))}</td>"
-                f"<td>{html.escape(item_label)}</td>"
+                f"<td>{html.escape(status)}</td>"
+                f"<td>{html.escape(item_label)}{item_details}</td>"
                 f"<td>{html.escape(transfer)}</td>"
                 f"<td>{html.escape(str(when).replace('T', ' ').replace('+00:00', ' UTC'))}</td>"
                 f"<td>{html.escape(str(detail))}"
+                + (f" <form class='inline-form' method='post' action='/job_cancel'><input type='hidden' name='csrf_token' value='{generate_csrf()}'>"
+                   f"<input type='hidden' name='job_id' value='{html.escape(job['job_id'], quote=True)}'>"
+                   f"<button {'disabled' if cancel_requested else ''}>{'Cancellation requested' if cancel_requested else 'Cancel pending' if job.get('status') == 'pending' else 'Request cancellation'}</button></form>"
+                   if job.get('status') in {'pending', 'running'} else "")
                 + (f" <form class='inline-form' method='post' action='/job_retry'><input type='hidden' name='csrf_token' value='{generate_csrf()}'>"
-                   f"<input type='hidden' name='job_id' value='{html.escape(job['job_id'], quote=True)}'><button>Retry</button></form>"
-                   if job.get('status') in {'failed', 'cancelled'} else "")
+                   f"<input type='hidden' name='job_id' value='{html.escape(job['job_id'], quote=True)}'><button>Retry remaining ({summary['retry_count']})</button></form>"
+                   if summary['can_retry'] else "")
                 + "</td>"
                 "</tr>"
             )
@@ -638,7 +761,10 @@ def register(app, DIRECTORIES):
         return (
             CSS_JS
             + "<div class='title-row'><h1 class='app-title'>Recent transfers</h1></div>"
+            + worker_health.banner()
             + "<p class='breadcrumbs'><a href='/'>← Back to files</a></p>"
+            + "<p><a href='/jobs'>Refresh queue</a> · Pending jobs run in queue order after the current transfer.</p>"
+            + "<p>Retry remaining retries failed and unstarted items. Completed items are kept.</p>"
             + "<table class='table'><thead><tr><th>Operation</th><th>Status</th>"
               "<th>Items</th><th>Progress</th><th>When</th><th>Details</th>"
               "</tr></thead><tbody>" + table + "</tbody></table>"
@@ -649,9 +775,10 @@ def register(app, DIRECTORIES):
         job_id = request.args.get("job_id", "")
         if not job_id:
             return {"success": False, "error": "Missing job id."}, 400
-        job, _ = job_store.find(job_id)
+        job, stored_path = job_store.find(job_id)
         if job is None or job.get("owner") != session.get("username"):
             return {"success": False, "error": "Job not found."}, 404
+        job["status"] = stored_path.parent.name
         public_job = {
             key: job[key]
             for key in (
@@ -661,15 +788,20 @@ def register(app, DIRECTORIES):
             )
             if key in job
         }
-        return {"success": True, **public_job}
+        position = job_store.queue_snapshot(session.get("username")).get(job_id, {}) if job["status"] == "pending" else {}
+        return {"success": True, **public_job, **job_store.item_summary(job), **position,
+                "cancellation_requested": job_store.cancellation_requested(job_id)}
 
     @app.route("/job_cancel", methods=["POST"], endpoint="job_cancel")
     def job_cancel():
-        payload = request.get_json(silent=True) or {}
+        payload = request.get_json(silent=True) or request.form
         job = job_store.request_cancel(payload.get("job_id", ""), session.get("username"))
         if job is None:
             return {"success": False, "error": "Job not found."}, 404
-        return {"success": True, "status": job.get("status")}
+        if not request.is_json and request.accept_mimetypes.best != "application/json":
+            return redirect("/jobs")
+        return {"success": True, "status": job.get("status"),
+                "cancellation_requested": job_store.cancellation_requested(job["job_id"])}
 
     @app.route("/job_retry", methods=["POST"], endpoint="job_retry")
     def job_retry():
@@ -683,7 +815,7 @@ def register(app, DIRECTORIES):
             authorize_job(old, DIRECTORIES, current_user_groups(
                 old["owner"], os.path.join(app.root_path, "users.json")))
             source, destination = job_store.retry_selection(old)
-            job = _enqueue_job(old["operation"], source, destination)
+            job = enqueue_job(old["operation"], source, destination)
         except PermissionError as error:
             return {"success": False, "error": str(error)}, 403
         except (KeyError, OSError, RuntimeError, ValueError) as error:
@@ -691,7 +823,7 @@ def register(app, DIRECTORIES):
         if request.accept_mimetypes.best == "application/json":
             return {"success": True, "job_id": job["job_id"],
                     "operation": job["operation"], "status": job["status"]}, 202
-        return _queued_job_response(job, old.get("source", {}).get("directory_index", 0), old.get("source", {}).get("path", ""))
+        return _queued_job_response(job, job["source"]["directory_index"], job["source"].get("path", ""))
 
     def configuration_groups():
         current_groups = current_user_groups(session.get("username"), os.path.join(app.root_path, "users.json"))
@@ -726,6 +858,7 @@ def register(app, DIRECTORIES):
         return (CSS_JS + "<div class='title-row'><h1 class='app-title'>Configuration</h1></div>"
                 "<p class='breadcrumbs'><a href='/'>← Back to files</a></p><h2>Directories</h2><ul>" + directories + "</ul>"
                 + "<h2>Remote destinations</h2>" + remote_error + "<ul>" + remote_rows + "</ul>"
+                + category_mappings.web_controls()
                 + f"<form id='reload-configuration'><input type='hidden' name='csrf_token' value='{generate_csrf()}'><button>Reload configuration</button></form>"
                   "<script>document.getElementById('reload-configuration').onsubmit=async e=>{e.preventDefault();const r=await fetch('/config_reload',{method:'POST',body:new FormData(e.target)});const d=await r.json();if(d.success)location.reload();else alert(d.error||'Reload failed');};</script>")
 
@@ -760,7 +893,7 @@ def register(app, DIRECTORIES):
         dest_path = request.args.get("dest_path", "")
 
         if not is_safe_path(src_path) or not is_safe_segment(src_name):
-            return warn_and_redirect(CSS_JS, "Invalid source path.", src_index, "")
+            return warn_and_redirect(CSS_JS, f"Invalid source path or filename: {src_path!r} / {src_name!r}.", src_index, "")
         if not is_safe_path(dest_path):
             return warn_and_redirect(CSS_JS, "Invalid destination path.",
                                      dest_index, "")
@@ -815,7 +948,7 @@ def register(app, DIRECTORIES):
             new_dest = f"{dest_path}/{name}".strip("/")
             folders_html += (
                 f"<li><a href='{_html.escape(move_picker_url(dest_index, new_dest), quote=True)}'>"
-                f"{_html.escape(name)}</a></li>"
+                f"📁 {_html.escape(name)}</a></li>"
             )
         folders_html += "</ul>"
 
@@ -829,8 +962,9 @@ def register(app, DIRECTORIES):
             + remote_copy.selector_html(src_index, src_path, [src_name], roots_html)
             + "<div id='local-destination-panel'>"
             + f"<div class='breadcrumbs'>{breadcrumb_html}</div><br>"
-            + f"<div class='move-here-top'>{move_here_html}</div><br>"
+            + "<div>Folders in this destination:</div>"
             + folders_html
+            + f"<div class='move-here-top'>{move_here_html}</div>"
             + "</div></div>"
         )
 
@@ -849,7 +983,7 @@ def register(app, DIRECTORIES):
         dest_path = request.form.get("dest_path", "")
 
         if not is_safe_path(src_path) or not is_safe_segment(src_name):
-            return warn_and_redirect(CSS_JS, "Invalid source path.", src_index, "")
+            return warn_and_redirect(CSS_JS, f"Invalid source path or filename: {src_path!r} / {src_name!r}.", src_index, "")
         if not is_safe_path(dest_path):
             return warn_and_redirect(CSS_JS, "Invalid destination path.",
                                      dest_index, "")
@@ -857,8 +991,8 @@ def register(app, DIRECTORIES):
         src_root, _ = DIRECTORIES[src_index]
         dest_root, _ = DIRECTORIES[dest_index]
 
-        src_full = safe_join(src_root, src_path, urllib.parse.unquote(src_name))
-        dest_full = safe_join(dest_root, dest_path, urllib.parse.unquote(src_name))
+        src_full = safe_join(src_root, src_path, src_name)
+        dest_full = safe_join(dest_root, dest_path, src_name)
         if src_full is None or dest_full is None:
             return warn_and_redirect(CSS_JS, "Path escapes root.", src_index, src_path)
 
@@ -869,18 +1003,20 @@ def register(app, DIRECTORIES):
             )
 
         if not os.path.lexists(src_full):
-            return warn_and_redirect(CSS_JS, "Source does not exist.", src_index, src_path)
+            log_operation("move", "failed", src_full, dest_full, src_name, "Source does not exist")
+            return warn_and_redirect(CSS_JS, f"Source does not exist: {src_name!r}.", src_index, src_path)
         if os.path.lexists(dest_full):
-            return warn_and_redirect(CSS_JS, "Destination already exists.", dest_index, dest_path)
+            log_operation("move", "failed", src_full, dest_full, src_name, "Destination already exists")
+            return warn_and_redirect(CSS_JS, f"Destination already exists: {src_name!r}.", dest_index, dest_path)
         try:
-            job = _enqueue_job(
+            job = enqueue_job(
                 "move",
                 {"directory_index": src_index, "path": src_path,
-                 "names": [urllib.parse.unquote(src_name)]},
+                 "names": [src_name]},
                 {"directory_index": dest_index, "path": dest_path,
-                 "names": [urllib.parse.unquote(src_name)]},
+                 "names": [src_name]},
             )
-        except (OSError, RuntimeError) as e:
+        except (OSError, RuntimeError, ValueError) as e:
             return warn_and_redirect(CSS_JS, f"Could not queue move: {e}", src_index, src_path)
         return _queued_job_response(job, dest_index, dest_path)
 
@@ -918,29 +1054,15 @@ def register(app, DIRECTORIES):
             return {"success": False, "error": "Invalid archive name."}
 
         try:
-            if archive_type == "zip":
-                with zipfile.ZipFile(archive_full, "w", zipfile.ZIP_DEFLATED) as zf:
-                    for n in names:
-                        fp = os.path.join(cwd, n)
-                        if os.path.isdir(fp):
-                            for r, _, files in os.walk(fp):
-                                for f in files:
-                                    full = os.path.join(r, f)
-                                    zf.write(full, os.path.relpath(full, cwd))
-                        else:
-                            zf.write(fp, n)
-            elif archive_type in ("tar", "tgz"):
-                mode = "w:gz" if archive_type == "tgz" else "w"
-                with tarfile.open(archive_full, mode) as tf:
-                    for n in names:
-                        tf.add(os.path.join(cwd, n), arcname=n)
-            elif archive_type == "7z":
-                return {"success": False, "error": "7z not supported."}
-            else:
-                return {"success": False, "error": f"Unknown archive type: {archive_type}"}
-        except OSError as e:
-            return {"success": False, "error": str(e)}
+            archive_ops.create_archive(root_dir, cwd, names, archive_full, archive_type)
+        except FileExistsError as error:
+            log_operation("archive", "failed", cwd, archive_full, ", ".join(names), str(error))
+            return {"success": False, "error": str(error)}, 409
+        except (OSError, ValueError, RuntimeError, zipfile.BadZipFile, tarfile.TarError) as error:
+            log_operation("archive", "failed", cwd, archive_full, ", ".join(names), str(error))
+            return {"success": False, "error": str(error)}, 400
 
+        log_operation("archive", "complete", cwd, archive_full, ", ".join(names))
         return {"success": True, "archive": archive_filename}
 
     # ---------------------------------------------------------
@@ -971,47 +1093,11 @@ def register(app, DIRECTORIES):
             return warn_and_redirect(CSS_JS, "Invalid extract target.",
                                      dir_index, path)
 
-        ext = os.path.splitext(archive_full.lower())[1]
         try:
-            if ext == ".zip":
-                with zipfile.ZipFile(archive_full) as zf:
-                    members = zf.infolist()
-                    total_size = _validate_archive_size([member.file_size for member in members])
-                    real_extract = os.path.realpath(extract_dir)
-                    for member in members:
-                        target = os.path.realpath(
-                            os.path.join(extract_dir, member.filename)
-                        )
-                        mode = member.external_attr >> 16
-                        if not (target == real_extract or target.startswith(real_extract + os.sep)):
-                            raise ValueError(f"Unsafe entry: {member.filename}")
-                        if stat.S_ISLNK(mode):
-                            raise ValueError(f"Archive links are not allowed: {member.filename}")
-                    ensure_free_space(os.path.dirname(extract_dir), total_size)
-                    os.makedirs(extract_dir, exist_ok=True)
-                    zf.extractall(extract_dir)
-            elif ext in (".tar", ".gz", ".tgz"):
-                mode = "r:gz" if ext in (".gz", ".tgz") else "r"
-                with tarfile.open(archive_full, mode) as tf:
-                    members = tf.getmembers()
-                    total_size = _validate_archive_size([member.size for member in members])
-                    real_extract = os.path.realpath(extract_dir)
-                    for member in members:
-                        target = os.path.realpath(
-                            os.path.join(extract_dir, member.name)
-                        )
-                        if not (target == real_extract or target.startswith(real_extract + os.sep)):
-                            raise ValueError(f"Unsafe entry: {member.name}")
-                        if member.issym() or member.islnk() or member.isdev() or member.isfifo():
-                            raise ValueError(f"Unsafe entry type: {member.name}")
-                    ensure_free_space(os.path.dirname(extract_dir), total_size)
-                    os.makedirs(extract_dir, exist_ok=True)
-                    tf.extractall(extract_dir, members=members)
-            else:
-                return warn_and_redirect(CSS_JS, f"Unsupported format: {ext}",
-                                         dir_index, path)
-        except (OSError, ValueError, zipfile.BadZipFile, tarfile.TarError) as e:
-            return warn_and_redirect(CSS_JS, f"Extract failed: {e}",
-                                     dir_index, path)
+            archive_ops.extract_archive(archive_full, extract_dir, _validate_archive_size)
+        except (OSError, ValueError, RuntimeError, zipfile.BadZipFile, tarfile.TarError) as error:
+            log_operation("extract", "failed", archive_full, extract_dir, name, str(error))
+            return warn_and_redirect(CSS_JS, f"Extract failed: {error}", dir_index, path)
 
+        log_operation("extract", "complete", archive_full, extract_dir, name)
         return _redirect_listing(dir_index, path)

@@ -10,6 +10,7 @@
 !/run.sh
 !/stop.sh
 !/actions.py
+!/archive_ops.py
 !/app.py
 !/auth.py
 !/browser.py
@@ -18,6 +19,13 @@
 !/job_worker.py
 !/manage_user.py
 !/move_downloads.py
+!/operation_log.py
+!/transfer_preview.py
+!/folder_listing.py
+!/worker_health.py
+!/category_mappings.py
+!/config_backups.py
+!/download_moves.py
 !/remote_copy.py
 !/styles.py
 !/uploads.py
@@ -33,11 +41,29 @@
 !/tests/test_browser.py
 !/tests/test_safety.py
 !/tests/test_config_check.py
+!/tests/test_convert.py
+!/tests/test_move_downloads.py
+!/tests/test_archives.py
+!/tests/test_job_identity.py
+!/tests/test_transfers.py
+!/tests/test_uploads.py
+!/tests/test_operation_log.py
+!/tests/test_superfetch_contract.py
+!/tests/test_transfer_preview.py
+!/tests/test_linux_integration.py
+!/tests/test_pagination.py
+!/tests/test_queue.py
+!/tests/test_worker_health.py
+!/tests/test_category_mappings.py
+!/tests/test_config_backups.py
+!/tests/test_download_moves.py
 !/tools/
 /tools/*
 !/tools/install.py
 !/tools/build_release.py
 !/tools/check_config.py
+!/tools/check_superfetch.py
+!/tools/config_backup.py
 
 # Never include generated Python files, even within allowed directories.
 __pycache__/

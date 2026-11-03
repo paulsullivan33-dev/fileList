@@ -4,10 +4,12 @@ import shutil
 import tempfile
 import uuid
 
-from flask import request, jsonify, abort
+from flask import request, jsonify, abort, session
+import operation_log
 from werkzeug.utils import secure_filename
+from job_worker import _rename_without_replace
 
-from utils import ensure_free_space, is_safe_path, is_safe_segment, safe_join, safe_dir_index
+from utils import configured_bytes, ensure_free_space, is_safe_path, is_safe_segment, safe_join, safe_dir_index
 
 
 # -----------------------------------------------------------------
@@ -34,8 +36,8 @@ ALLOWED_EXTENSIONS = {
 }
 
 # 500 MB per file, 2 GB per request
-MAX_FILE_SIZE = int(os.environ.get("MAX_FILE_SIZE", 500 * 1024 * 1024))
-MAX_REQUEST_SIZE = int(os.environ.get("MAX_REQUEST_SIZE", 2 * 1024 * 1024 * 1024))
+MAX_FILE_SIZE = configured_bytes("MAX_FILE_SIZE", 500 * 1024 * 1024)
+MAX_REQUEST_SIZE = configured_bytes("MAX_REQUEST_SIZE", 2 * 1024 * 1024 * 1024)
 
 RESERVED_NAMES = {".", "..", ".htaccess", ".git", ".gitignore"}
 
@@ -79,22 +81,37 @@ def _save_stream(fs, target_dir, max_size):
     if not _allowed(name):
         raise ValueError(f"extension not allowed: {name}")
 
-    dest = os.path.join(target_dir, name)
-    if os.path.exists(dest):
-        dest = _unique_path(target_dir, name)
-
+    descriptor, temporary = tempfile.mkstemp(prefix=".filelist-upload-", suffix=".partial", dir=target_dir)
     written = 0
-    with open(dest, "wb") as out:
+    try:
+        with os.fdopen(descriptor, "wb") as out:
+            while True:
+                buf = fs.stream.read(1024 * 1024)
+                if not buf:
+                    break
+                written += len(buf)
+                if written > max_size:
+                    raise ValueError(f"file too large (max {max_size} bytes)")
+                ensure_free_space(target_dir, len(buf))
+                out.write(buf)
+            out.flush()
+            os.fsync(out.fileno())
+
+        base, extension = os.path.splitext(name)
+        number = 0
         while True:
-            buf = fs.stream.read(1024 * 1024)
-            if not buf:
+            filename = name if number == 0 else f"{base} ({number}){extension}"
+            dest = os.path.join(target_dir, filename)
+            try:
+                # Atomically publish a complete file; a competing upload or a
+                # symlink already at this name is a collision, never a target.
+                _rename_without_replace(temporary, dest)
                 break
-            written += len(buf)
-            if written > max_size:
-                out.close()
-                os.remove(dest)
-                raise ValueError(f"file too large (max {max_size} bytes)")
-            out.write(buf)
+            except FileExistsError:
+                number += 1
+    finally:
+        if os.path.lexists(temporary):
+            os.remove(temporary)
 
     return {"name": os.path.basename(dest), "size": written}
 
@@ -141,8 +158,12 @@ def register(app, DIRECTORIES):
             try:
                 result = _save_stream(fs, target_dir, MAX_FILE_SIZE)
                 saved.append(result)
+                operation_log.record(session.get("username"), "upload", "complete", source=fs.filename,
+                                     destination=os.path.join(target_dir, result["name"]), item=result["name"])
             except (ValueError, OSError) as e:
                 errors.append({"name": fs.filename, "error": str(e)})
+                operation_log.record(session.get("username"), "upload", "failed", source=fs.filename,
+                                     destination=target_dir, item=fs.filename, detail=str(e))
 
         return jsonify({
             "success": not errors,

@@ -217,6 +217,37 @@ class RemoteCopyTests(unittest.TestCase):
         self.assertIsNone(record["remote_partial_path"])
         self.assertTrue((self.source / "a file.txt").exists())
 
+    def test_remote_copy_accepts_double_period_filename(self):
+        name = "release..txt"
+        (self.source / name).write_text("content", encoding="utf-8")
+        response = self.submit(name=[name])
+        self.assertEqual(response.status_code, 200)
+        job, path = job_store.claim_next()
+        commands = []
+        self.run_job(job, path, lambda command, check: commands.append(command))
+        self.assertEqual(commands[1][-2], str(self.source / name))
+        self.assertEqual(job_store.read_path(path)["completed_names"], [name])
+
+    def test_queued_remote_copy_keeps_original_source_after_reordering(self):
+        job, path = self.job()
+        other = self.root / "other"
+        other.mkdir()
+        (other / "a file.txt").write_text("unrelated", encoding="utf-8")
+        self.directories.insert(0, Directory(str(other), "/other", "Other", "allowed"))
+        commands = []
+        self.run_job(job, path, lambda command, check: commands.append(command))
+        self.assertEqual(commands[1][-2], str(self.source / "a file.txt"))
+
+    def test_remote_copy_rejects_replaced_source_before_ssh(self):
+        job, path = self.job()
+        other = self.root / "other"
+        other.mkdir()
+        self.directories[0] = Directory(str(other), "/other", "Other", "allowed")
+        process = Mock()
+        with self.assertRaisesRegex(ValueError, "identity changed"):
+            self.run_job(job, path, process)
+        process.assert_not_called()
+
     def test_rsync_failure_never_publishes(self):
         job, path = self.job()
         commands = []
@@ -224,7 +255,7 @@ class RemoteCopyTests(unittest.TestCase):
             commands.append(command)
             if command[0] == "rsync":
                 raise RuntimeError("connection failed")
-        with self.assertRaisesRegex(RuntimeError, "connection failed"):
+        with self.assertRaisesRegex(RuntimeError, "a file.txt.*connection failed"):
             self.run_job(job, path, process)
         self.assertEqual(len(commands), 2)
         self.assertIn(".partial", job_store.read_path(path)["remote_partial_path"])
@@ -243,6 +274,11 @@ class RemoteCopyTests(unittest.TestCase):
             self.run_job(job, path, process)
         failed = job_store.finish(path, "failed", "Second transfer failed")
         self.assertEqual(failed["completed_names"], ["a file.txt"])
+        summary = job_store.item_summary(failed)
+        self.assertEqual(summary["failed_names"], ["folder"])
+        self.assertEqual(summary["remaining_names"], [])
+        self.assertEqual(summary["retry_count"], 1)
+        self.assertTrue(summary["can_retry"])
         source, destination = job_store.retry_selection(failed)
         self.assertEqual(source["names"], ["folder"])
         retry = job_store.create("remote_copy", "tester", source, destination)

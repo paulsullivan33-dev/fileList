@@ -2,6 +2,7 @@
 import argparse
 import ctypes
 import errno
+import json
 import os
 import shutil
 import subprocess
@@ -13,11 +14,16 @@ from pathlib import Path
 
 import config_loader
 import job_store
-from utils import authorize_job, current_user_groups, ensure_free_space, is_safe_path, is_safe_segment, safe_dir_index, safe_join
+import operation_log
+import worker_health
+from utils import authorize_job, current_user_groups, ensure_free_space, is_safe_path, is_safe_segment, safe_dir_index, safe_join, transfer_item, resolve_job_directory
 
 
 CHUNK_SIZE = 4 * 1024 * 1024
-PROGRESS_INTERVAL = float(os.environ.get("JOB_PROGRESS_INTERVAL", "2"))
+try:
+    PROGRESS_INTERVAL = float(os.environ.get("JOB_PROGRESS_INTERVAL", "2"))
+except ValueError:
+    PROGRESS_INTERVAL = 2.0  # Startup validation reports the invalid setting.
 AT_FDCWD = -100
 RENAME_NOREPLACE = 1
 
@@ -28,18 +34,17 @@ class JobCancelled(Exception):
 
 def _rename_without_replace(source, destination):
     """Use Linux renameat2 so a late destination collision cannot overwrite data."""
-    if not sys.platform.startswith("linux"):
+    if os.name == "nt":
         if os.path.lexists(destination):
             raise FileExistsError(destination)
         os.rename(source, destination)
         return
+    if not sys.platform.startswith("linux"):
+        raise OSError(errno.ENOTSUP, "Atomic no-replace rename is unavailable on this system.")
     libc = ctypes.CDLL(None, use_errno=True)
     renameat2 = getattr(libc, "renameat2", None)
     if renameat2 is None:
-        if os.path.lexists(destination):
-            raise FileExistsError(destination)
-        os.rename(source, destination)
-        return
+        raise OSError(errno.ENOTSUP, "Atomic no-replace rename is unavailable on this system.")
     result = renameat2(
         AT_FDCWD, os.fsencode(source), AT_FDCWD, os.fsencode(destination), RENAME_NOREPLACE
     )
@@ -49,6 +54,7 @@ def _rename_without_replace(source, destination):
 
 
 def _check_cancel(job_id):
+    worker_health.checkpoint()
     if job_store.cancellation_requested(job_id):
         raise JobCancelled("Cancelled by user.")
 
@@ -60,8 +66,10 @@ def _measure(path):
         return os.path.getsize(path)
     total = 0
     for root, directories, files in os.walk(path, followlinks=False):
+        worker_health.checkpoint()
         directories[:] = [name for name in directories if not os.path.islink(os.path.join(root, name))]
         for name in files:
+            worker_health.checkpoint()
             item = os.path.join(root, name)
             if not os.path.islink(item):
                 total += os.path.getsize(item)
@@ -103,6 +111,7 @@ def _copy_file(source, destination, progress):
             chunk = input_file.read(CHUNK_SIZE)
             if not chunk:
                 break
+            ensure_free_space(os.path.dirname(destination), len(chunk))
             output_file.write(chunk)
             progress.add(len(chunk))
         output_file.flush()
@@ -147,13 +156,16 @@ def _remove(path):
 def _copy_staged(source, destination, progress):
     if os.path.lexists(destination):
         raise FileExistsError(f"Destination already exists: {os.path.basename(destination)}")
+    ensure_free_space(os.path.dirname(destination), _measure(source))
     temporary = os.path.join(
         os.path.dirname(destination),
         f".{os.path.basename(destination)}.{uuid.uuid4().hex}.partial",
     )
     job_store.update(progress.path, temporary_path=temporary)
     try:
-        if os.path.isdir(source):
+        if os.path.islink(source):
+            os.symlink(os.readlink(source), temporary, target_is_directory=os.path.isdir(source))
+        elif os.path.isdir(source):
             _copy_tree(source, temporary, progress)
         else:
             _copy_file(source, temporary, progress)
@@ -168,11 +180,11 @@ def _copy_staged(source, destination, progress):
         raise
 
 
-def _validated_items(job, directories):
+def _validated_items(job, directories, job_path=None):
     source_info = job["source"]
     destination_info = job["destination"]
-    source_index = safe_dir_index(source_info.get("directory_index"), directories)
-    destination_index = safe_dir_index(destination_info.get("directory_index"), directories)
+    source_index = resolve_job_directory(source_info, directories)
+    destination_index = resolve_job_directory(destination_info, directories)
     source_path = source_info.get("path", "")
     destination_path = destination_info.get("path", "")
     names = source_info.get("names") or []
@@ -182,7 +194,6 @@ def _validated_items(job, directories):
         or not is_safe_path(source_path)
         or not is_safe_path(destination_path)
         or not names
-        or not all(is_safe_segment(name) for name in names)
     ):
         raise ValueError("Invalid queued paths.")
     source_root, _ = directories[source_index]
@@ -192,6 +203,10 @@ def _validated_items(job, directories):
         raise ValueError("Destination directory no longer exists.")
     items = []
     for name in names:
+        if job_path is not None:
+            job_store.start_item(job_path, name)
+        if not is_safe_segment(name):
+            raise ValueError(f"Invalid selected item: {name!r}")
         source = safe_join(source_root, source_path, name)
         destination = safe_join(destination_root, destination_path, name)
         if source is None or destination is None or not os.path.lexists(source):
@@ -208,40 +223,141 @@ def _validated_items(job, directories):
 
 
 def _run_transfer(job, path, directories):
-    items = _validated_items(job, directories)
-    total = sum(_measure(source) for source, _ in items)
+    items = _validated_items(job, directories, path)
+    total = 0
+    for name, (source, _) in zip(job["source"]["names"], items):
+        job_store.start_item(path, name)
+        with transfer_item(name):
+            total += _measure(source)
+    job_store.update(path, current_name=None)
+    if job["operation"] == "copy":
+        ensure_free_space(os.path.dirname(items[0][1]), total)
     progress = Progress(job, path, total)
     for name, (source, destination) in zip(job["source"]["names"], items):
-        _check_cancel(job["job_id"])
-        if job["operation"] == "move":
-            try:
-                _rename_without_replace(source, destination)
-                job_store.complete_item(path, name)
-                progress.add(_measure(destination), force=True)
-                continue
-            except OSError as error:
-                if error.errno != errno.EXDEV:
-                    raise
-        _copy_staged(source, destination, progress)
-        if job["operation"] == "move":
-            try:
-                _remove(source)
-            except OSError as error:
-                raise OSError(
-                    "Destination completed, but source removal failed; both copies remain: "
-                    f"{error}"
-                ) from error
-        job_store.complete_item(path, name)
+        job_store.start_item(path, name)
+        with transfer_item(name):
+            _check_cancel(job["job_id"])
+            if job["operation"] == "move":
+                try:
+                    _rename_without_replace(source, destination)
+                    job_store.complete_item(path, name)
+                    progress.add(_measure(destination), force=True)
+                    continue
+                except OSError as error:
+                    if error.errno != errno.EXDEV:
+                        raise
+            _copy_staged(source, destination, progress)
+            if job["operation"] == "move":
+                try:
+                    _remove(source)
+                except OSError as error:
+                    raise OSError(
+                        "Destination completed, but source removal failed; both copies remain: "
+                        f"{error}"
+                    ) from error
+            job_store.complete_item(path, name)
     progress.add(0, force=True)
+
+
+def _probe_stream_codecs(source):
+    """Probe a media file's first real video and audio streams with ffprobe.
+
+    Returns ((video_codec, video_index), (audio_codec, audio_index)); either
+    entry is None when that stream type is absent, and both are None when
+    probing is unavailable or fails.  Attached pictures (cover art) are not
+    counted as video.
+    """
+    ffprobe = shutil.which("ffprobe")
+    if not ffprobe:
+        return None, None
+    try:
+        result = subprocess.run(
+            [ffprobe, "-v", "error", "-show_streams", "-of", "json", source],
+            capture_output=True, text=True, timeout=60, check=False,
+        )
+        streams = json.loads(result.stdout).get("streams", [])
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return None, None
+    video = None
+    audio = None
+    for stream in streams:
+        if not isinstance(stream, dict):
+            continue
+        codec = stream.get("codec_name")
+        index = stream.get("index")
+        if not codec or index is None:
+            continue
+        if stream.get("codec_type") == "video" and video is None:
+            disposition = stream.get("disposition") or {}
+            if disposition.get("attached_pic"):
+                continue
+            video = (codec, index)
+        elif stream.get("codec_type") == "audio" and audio is None:
+            audio = (codec, index)
+    return video, audio
+
+
+def _conversion_arg_sets(source):
+    """Ordered ffmpeg argument sets to try for converting source to MP4.
+
+    AVI/MPG sources keep the historical single full transcode.  MKV sources
+    are probed: an H.264 video stream is copied rather than re-encoded --
+    with the audio copied too when it is already AAC, otherwise transcoded
+    to AAC -- and a full transcode is the fallback when the copy attempt is
+    not possible or fails.  MKV attempts map only the chosen video and
+    audio streams, so embedded subtitles are not carried into the MP4.
+    """
+    transcode = ["-c:v", "libx264", "-c:a", "aac"]
+    if not source.lower().endswith(".mkv"):
+        return [transcode]
+    video, audio = _probe_stream_codecs(source)
+    if video is None:
+        return [transcode]
+    maps = ["-map", f"0:{video[1]}"]
+    if audio is not None:
+        maps += ["-map", f"0:{audio[1]}"]
+    attempts = []
+    if video[0] == "h264":
+        if audio is None or audio[0] == "aac":
+            attempts.append(maps + ["-c", "copy"])
+        else:
+            attempts.append(maps + ["-c:v", "copy", "-c:a", "aac"])
+    attempts.append(maps + transcode)
+    return attempts
+
+
+def _run_ffmpeg(command, job_id):
+    """Run one ffmpeg command to completion.
+
+    Returns (returncode, stderr_text).  Raises JobCancelled when the job's
+    cancellation flag is set while ffmpeg runs.
+    """
+    with tempfile.TemporaryFile(mode="w+t", encoding="utf-8") as error_log:
+        process = subprocess.Popen(
+            command, stdout=subprocess.DEVNULL, stderr=error_log, text=True
+        )
+        while process.poll() is None:
+            worker_health.checkpoint()
+            if job_store.cancellation_requested(job_id):
+                process.terminate()
+                try:
+                    process.wait(timeout=10)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                raise JobCancelled("Cancelled by user.")
+            time.sleep(1)
+        error_log.seek(0)
+        return process.returncode, error_log.read()
 
 
 def _run_conversion(job, path, directories):
     source_info = job["source"]
-    index = safe_dir_index(source_info.get("directory_index"), directories)
+    index = resolve_job_directory(source_info, directories)
     relative_path = source_info.get("path", "")
     names = source_info.get("names") or []
     if index is None or not is_safe_path(relative_path) or len(names) != 1 or not is_safe_segment(names[0]):
         raise ValueError("Invalid queued conversion path.")
+    job_store.start_item(path, names[0])
     root, _ = directories[index]
     source = safe_join(root, relative_path, names[0])
     output_name = os.path.splitext(names[0])[0] + ".mp4"
@@ -256,42 +372,38 @@ def _run_conversion(job, path, directories):
         raise RuntimeError("ffmpeg is not installed or is not on PATH.")
     temporary = output + f".{job['job_id']}.partial.mp4"
     job_store.update(path, temporary_path=temporary)
-    command = [
-        ffmpeg, "-nostdin", "-hide_banner", "-loglevel", "error",
-        "-i", source, "-c:v", "libx264", "-c:a", "aac",
-        "-movflags", "+faststart", temporary,
-    ]
-    with tempfile.TemporaryFile(mode="w+t", encoding="utf-8") as error_log:
-        process = subprocess.Popen(
-            command, stdout=subprocess.DEVNULL, stderr=error_log, text=True
-        )
-        try:
-            while process.poll() is None:
-                if job_store.cancellation_requested(job["job_id"]):
-                    process.terminate()
-                    try:
-                        process.wait(timeout=10)
-                    except subprocess.TimeoutExpired:
-                        process.kill()
-                    raise JobCancelled("Cancelled by user.")
-                time.sleep(1)
-            error_log.seek(0)
-            error = error_log.read()
-            if process.returncode != 0:
-                raise RuntimeError((error or "ffmpeg exited with an error.").strip()[-2000:])
-            if os.path.lexists(output):
-                raise FileExistsError(f"Destination already exists: {output_name}")
-            _rename_without_replace(temporary, output)
-            job_store.update(path, temporary_path=None)
-        finally:
+    try:
+        error = ""
+        for arg_set in _conversion_arg_sets(source):
+            command = [
+                ffmpeg, "-nostdin", "-hide_banner", "-loglevel", "error",
+                "-i", source, *arg_set,
+                "-movflags", "+faststart", temporary,
+            ]
+            returncode, error = _run_ffmpeg(command, job["job_id"])
+            if returncode == 0:
+                break
             if os.path.lexists(temporary):
                 os.remove(temporary)
+        else:
+            raise RuntimeError((error or "ffmpeg exited with an error.").strip()[-2000:])
+        if os.path.lexists(output):
+            raise FileExistsError(f"Destination already exists: {output_name}")
+        _rename_without_replace(temporary, output)
+        job_store.update(path, temporary_path=None)
+        job_store.complete_item(path, names[0])
+    finally:
+        if os.path.lexists(temporary):
+            os.remove(temporary)
 
 
 def run_once():
+    worker_health.checkpoint(state="checking_queue", phase="Checking the queue", job_id=None)
     job, path = job_store.claim_next()
     if job is None:
+        worker_health.checkpoint(state="idle", phase="Waiting for jobs", job_id=None)
         return False
+    worker_health.checkpoint(state="busy", phase="Processing transfer", job_id=job["job_id"])
     try:
         directories = config_loader.load_directories()
         if job["operation"] in {"copy", "move", "convert"}:
@@ -310,6 +422,8 @@ def run_once():
         job_store.finish(path, "cancelled", str(error))
     except Exception as error:
         job_store.finish(path, "failed", str(error))
+    finally:
+        worker_health.checkpoint(state="idle", phase="Waiting for jobs", job_id=None)
     return True
 
 
@@ -328,22 +442,40 @@ def _worker_lock():
     return handle
 
 
+def _prune_operation_log():
+    try:
+        operation_log.prune(int(os.environ.get("FILELIST_LOG_RETENTION_DAYS", "30")))
+    except (OSError, operation_log.sqlite3.Error) as error:
+        import logging
+        logging.getLogger(__name__).warning("Could not prune operation logs: %s", error)
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description="Process fileList background jobs.")
     parser.add_argument("--once", action="store_true", help="Process at most one job.")
     parser.add_argument("--poll-interval", type=float, default=1.0)
     args = parser.parse_args(argv)
+    from tools.check_config import require_startup
+    require_startup()
     lock = _worker_lock()
+    monitor = worker_health.Monitor(job_store.job_root()).start()
     try:
+        worker_health.checkpoint(state="recovering", phase="Recovering interrupted jobs")
         job_store.recover_interrupted()
         job_store.cleanup_history(int(os.environ.get("JOB_HISTORY_DAYS", "7")))
+        _prune_operation_log()
+        next_log_cleanup = time.monotonic() + 86400
         while True:
+            if time.monotonic() >= next_log_cleanup:
+                _prune_operation_log()
+                next_log_cleanup = time.monotonic() + 86400
             worked = run_once()
             if args.once:
                 return 0
             if not worked:
                 time.sleep(max(args.poll_interval, 0.1))
     finally:
+        monitor.stop()
         lock.close()
 
 

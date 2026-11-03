@@ -3,6 +3,7 @@
 import argparse
 import json
 import os
+import re
 from pathlib import Path
 import shlex
 import shutil
@@ -16,6 +17,7 @@ if str(ROOT) not in sys.path:
 
 import job_store
 import remote_copy
+from config_loader import read_directories
 
 
 def load_json(path):
@@ -24,34 +26,17 @@ def load_json(path):
             return json.load(source), None
     except FileNotFoundError:
         return None, f"Missing: {path}"
-    except (OSError, json.JSONDecodeError) as error:
+    except (OSError, ValueError) as error:
         return None, f"Cannot read {path}: {error}"
 
 
 def check_directories(path):
-    data, error = load_json(path)
-    if error:
-        return [], [error]
-    if not isinstance(data, list) or not data:
-        return [], ["directories.json must be a non-empty JSON array."]
-    messages, errors = [], []
-    for number, entry in enumerate(data, 1):
-        if not isinstance(entry, dict):
-            errors.append(f"Directory {number} must be an object.")
-            continue
-        root, url, group = entry.get("root"), entry.get("url"), entry.get("group")
-        if not all(isinstance(value, str) and value.strip() for value in (root, url, group)):
-            errors.append(f"Directory {number} requires non-empty root, url, and group values.")
-            continue
-        folder = Path(root).expanduser()
-        if not folder.is_absolute() or not folder.is_dir():
-            errors.append(f"Directory {number} root is not an existing absolute directory: {root}")
-            continue
-        if not os.access(folder, os.R_OK | os.W_OK | os.X_OK):
-            errors.append(f"Directory {number} root is not readable and writable: {root}")
-            continue
-        messages.append(f"Directory {number}: {root} ({entry.get('name') or folder.name})")
-    return messages, errors
+    try:
+        directories = read_directories(path)
+    except ValueError as error:
+        return [], str(error).splitlines()
+    return [f"Directory {number}: {directory.root} ({directory.name})"
+            for number, directory in enumerate(directories, 1)], []
 
 
 def check_users(path):
@@ -72,20 +57,60 @@ def check_users(path):
     return [f"Users: {len(names)} configured"], errors
 
 
-def check_runtime():
-    messages, errors = [], []
-    for command in ("ssh", "rsync"):
-        executable = shutil.which(command)
-        if executable:
-            messages.append(f"{command}: {executable}")
-        else:
-            errors.append(f"Required command is unavailable: {command}")
-    root = job_store.job_root()
-    parent = root.parent
-    if parent.exists() and os.access(parent, os.W_OK | os.X_OK):
-        messages.append(f"Job directory: {root}")
-    else:
-        errors.append(f"Job directory parent is not writable: {parent}")
+def check_writable_location(path, label):
+    path = Path(path)
+    if path.exists() and not path.is_dir():
+        return [], [f"{label} is not a directory: {path}"]
+    ancestor = path
+    while not ancestor.exists() and ancestor != ancestor.parent:
+        ancestor = ancestor.parent
+    if not ancestor.is_dir() or not os.access(ancestor, os.W_OK | os.X_OK):
+        return [], [f"{label} cannot be created or written: {path}"]
+    return [f"{label}: {path}"], []
+
+
+def check_runtime(require_remote_tools=False):
+    messages, errors = check_writable_location(job_store.job_root(), "Job directory")
+    import operation_log
+    log = operation_log.database_path()
+    log_messages, log_errors = check_writable_location(log.parent, "Operation log directory")
+    messages.extend(log_messages)
+    errors.extend(log_errors)
+    if log.exists() and (not log.is_file() or not os.access(log, os.W_OK)):
+        errors.append(f"Operation log is not a writable file: {log}")
+    if require_remote_tools:
+        for command in ("ssh", "rsync"):
+            executable = shutil.which(command)
+            if executable:
+                messages.append(f"{command}: {executable}")
+            else:
+                errors.append(f"Remote copying requires an unavailable command: {command}")
+    settings = {
+        "PORT": (1, 65535), "MAX_FILE_SIZE": (1, None), "MAX_REQUEST_SIZE": (1, None),
+        "FILELIST_MIN_FREE_BYTES": (0, None), "FILELIST_REMOTE_MIN_FREE_BYTES": (0, None),
+        "JOB_MAX_PENDING_PER_USER": (1, None), "JOB_HISTORY_DAYS": (0, None),
+        "FILELIST_LOG_RETENTION_DAYS": (1, None), "LOGIN_MAX_ATTEMPTS": (1, None),
+        "FILELIST_WORKER_STALE_SECONDS": (5, None), "FILELIST_WORKER_STALL_SECONDS": (10, None),
+        "LOGIN_WINDOW_SECONDS": (1, None), "LOGIN_LOCK_SECONDS": (1, None),
+        "ARCHIVE_MAX_MEMBERS": (1, None), "ARCHIVE_MAX_UNCOMPRESSED_BYTES": (0, None),
+    }
+    for name, (minimum, maximum) in settings.items():
+        if name not in os.environ:
+            continue
+        try:
+            value = int(os.environ[name])
+            if value < minimum or (maximum is not None and value > maximum):
+                raise ValueError()
+        except ValueError:
+            errors.append(f"{name} must be an integer >= {minimum}" + (f" and <= {maximum}." if maximum else "."))
+    if "JOB_PROGRESS_INTERVAL" in os.environ:
+        try:
+            import math
+            value = float(os.environ["JOB_PROGRESS_INTERVAL"])
+            if not math.isfinite(value) or value <= 0:
+                raise ValueError()
+        except ValueError:
+            errors.append("JOB_PROGRESS_INTERVAL must be a positive finite number.")
     return messages, errors
 
 
@@ -123,20 +148,43 @@ def check_remotes(verify_ssh=False):
     return messages, errors
 
 
+def validate_startup(config=None, users=None, verify_ssh=False):
+    config = Path(config or os.environ.get("FILELIST_CONFIG", ROOT / "directories.json")).expanduser()
+    users = Path(users or ROOT / "users.json")
+    directory_check = check_directories(config)
+    user_check = check_users(users)
+    remote_check = check_remotes(verify_ssh)
+    try:
+        require_remote_tools = bool(remote_copy.load_destinations())
+    except (OSError, ValueError):
+        require_remote_tools = False
+    runtime_check = check_runtime(require_remote_tools)
+    return ([message for check in (directory_check, user_check, remote_check, runtime_check) for message in check[0]],
+            [error for check in (directory_check, user_check, remote_check, runtime_check) for error in check[1]])
+
+
+def require_startup(config=None, users=None):
+    _, errors = validate_startup(config, users)
+    if errors:
+        raise RuntimeError("fileList cannot start:\n" + "\n".join(errors))
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--ssh", action="store_true", help="Verify passwordless SSH, remote write access, and rsync")
+    parser.add_argument("--categories", action="store_true", help="Also check observed superFetch category destination mappings")
     args = parser.parse_args(argv)
-    config = Path(os.environ.get("FILELIST_CONFIG", ROOT / "directories.json")).expanduser()
-    users = ROOT / "users.json"
-    checks = [check_directories(config), check_users(users), check_runtime(), check_remotes(args.ssh)]
-    errors = []
-    for messages, failures in checks:
-        for message in messages:
-            print("OK:", message)
-        for failure in failures:
-            print("ERROR:", failure)
-        errors.extend(failures)
+    messages, errors = validate_startup(verify_ssh=args.ssh)
+    for message in messages:
+        print("OK:", message)
+    for error in errors:
+        print("ERROR:", error)
+    if args.categories:
+        import category_mappings
+        report = category_mappings.check()
+        category_mappings.print_report(report)
+        if report["status"] != "ok":
+            errors.append("Download category mappings need attention.")
     if errors:
         print(f"Configuration check failed with {len(errors)} error(s).")
         return 1

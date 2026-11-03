@@ -85,6 +85,17 @@ Run the regression suite after installing dependencies:
 
 SSH commands are simulated in these tests; verify real remote connectivity on
 each deployment server.
+On Linux, the same suite also starts real workers with disposable users, folders,
+and job queues. It exercises moves between `/tmp` and `/dev/shm`, low-space refusal,
+cancellation during copying, a killed worker followed by restart/retry, and worker
+lock contention. No installed configuration or real user files are used. A small
+timing delay keeps interruption tests deterministic without replacing file I/O.
+These tests are skipped on Windows. Cross-filesystem cases require a writable
+second filesystem at `/dev/shm`; CI requires them to run rather than skip.
+
+```bash
+FILELIST_REQUIRE_LINUX_INTEGRATION=1 .venv/bin/python -m unittest discover -s tests -p test_linux_integration.py -v
+```
 
 Validate the installed configuration before starting the service or after a
 server change:
@@ -96,6 +107,47 @@ server change:
 Add `--ssh` to verify each configured remote destination with the same account
 that runs fileList. It checks passwordless SSH, remote-directory write access,
 and remote `rsync` availability without copying files.
+
+`start` and `run.sh` now perform this check automatically, including remote
+availability, before launching either process. Direct Flask and worker launches
+also validate local configuration and required tools. Fix the numbered entries
+or named settings reported in the error before restarting. Missing configured
+folders are never created automatically: create the intended folder or restore
+its mount first. Relative roots resolve against the configuration file's folder.
+SSH and rsync are required only when remote destinations are configured.
+
+In **Configuration**, choose **Check category mappings** to compare observed
+superFetch labels against `move_downloads.json` destination keys. The check reads
+the shared download history and configured feed caches without moving files or
+fetching feeds. It identifies missing mappings and reports incomplete coverage
+when histories/caches are missing or unreadable. It uses actual category labels
+(for example `Books > eBook`), not numeric feed IDs. New categories can be detected
+after superFetch refreshes its caches; unseen future labels cannot be predicted.
+
+```bash
+.venv/bin/python move_downloads.py --check-mappings
+.venv/bin/python tools/check_config.py --categories
+```
+
+Set `FILELIST_MOVE_CONFIG` for a non-default mover configuration. Set
+`SUPERFETCH_DATA_DIR` (or pass `--superfetch-data` to the mover check) for the
+producer's history/XML folder; otherwise the sibling superFetch folder is used,
+matching superFetch's default. `SUPERFETCH_SOURCE` locates its feed catalog when
+the repository is elsewhere. Missing mover configuration is reported as
+**not_configured**, and is never created automatically. Category checks do not
+block normal application startup unless explicitly requested with `--categories`.
+
+Download routing is checked against the actual superFetch producer, including
+sanitized names, byte truncation, category-specific hashes, and history parsing:
+
+```bash
+.venv/bin/python tools/check_superfetch.py --superfetch ../superFetch
+```
+
+The regression suite checks the sibling superFetch repository when present; set
+`SUPERFETCH_SOURCE` to another `readAndParse.py` path if needed. CI checks out
+superFetch's default branch and runs this contract check on every push and PR.
+The checker loads only the naming/history functions and never runs downloads.
 
 A multi-directory, browser-based file manager built with Flask. Manage your files with a clean UI featuring dark mode, archive handling, file previews, and robust path validation — all from a lightweight Python web server.
 
@@ -121,7 +173,46 @@ python -c "from werkzeug.security import generate_password_hash; print(generate_
 
 Paste the generated value into `users.json`; never store a plain-text password there.
 
+`manage_user.py` now saves a dated backup before replacing existing user settings.
+Backups live beside the original file in `.config-backups/<UTC timestamp>-<id>/`.
+Use the same helpers before manually editing other JSON configuration files:
+
+```bash
+.venv/bin/python tools/config_backup.py backup directories.json
+.venv/bin/python tools/config_backup.py list directories.json
+.venv/bin/python tools/config_backup.py restore .config-backups/<backup-id>
+```
+
+Restore defaults to the original path recorded in the backup; `--target path.json`
+restores elsewhere. It checks the saved contents and backs up current settings
+before restoring exact previous bytes. Backup failure stops a settings replacement.
+Automatic backups cover user-management updates and restores; manual edits in an
+external editor require running the backup command yourself. Existing configuration
+files are still preserved by the release installer.
+After restoring directory settings, use **Reload configuration** or restart the
+application so its active folder list reflects the restored file.
+
+The standalone `move_downloads.py` uses the worker's atomic rename, staged copy,
+and free-space checks. Existing names (including dangling links) are never replaced.
+It requires the same Windows/Linux atomic-rename support as worker file operations.
+Same-drive moves rename without reserving space for a second copy; cross-drive
+moves publish a complete staged copy before removing the source. Sources should
+remain unchanged during copying, as with worker transfers.
+
+Each source folder has a `.filelist-move-state` recovery journal and mover lock.
+Only one standalone mover can use that source at a time; its work never enters the
+web application's queue. Rerunning the command cleans recognized interrupted
+partials and retries unfinished source items. Completed items are already absent
+from the source, so they are not repeated. If a destination was published but the
+source remains, both are preserved and the output asks for manual review. Completed
+journal entries are kept for 30 days. `--dry-run` creates no recovery or destination
+files. Interrupted commands can therefore be rerun without overwriting prior data.
+
 Each directory in `directories.json` needs a display `name` and a `group`.
+An optional unique `id` (letters, numbers, underscores, and hyphens) gives it an
+explicit identity. Without one, fileList derives a stable ID from the absolute
+root, so existing configuration files need no changes. Keep explicit IDs stable
+when rearranging entries; do not reuse them for different folders.
 Only users whose comma-delimited `groups` list contains that exact directory group
 can see or access it. For example:
 
@@ -222,17 +313,78 @@ byte progress, can be cancelled, survive browser navigation, and remain visible
 after Flask restarts. If the worker stops during a job, that job is marked
 failed on the next worker start and can be submitted again.
 
+Folders display 100 items per page by default; choose 25, 50, 100, or 250 with
+**Items per page**. Search applies to every filename in the current folder, not
+just the displayed page. Submit the search with Enter or **Search**. Name, size,
+and modified-date sorting also apply across all pages. Folder links retain sort
+and page size, while starting a fresh search in the folder you open.
+
+Normal name browsing reads full size/date details only for displayed rows;
+ordering by size or date reads those values for every matching entry. Directory
+names still need to be enumerated for a consistent page and match count. The
+initial size/count summary describes the current page. **Calculate folder totals**
+explicitly scans the folder's direct contents, with unreadable entries reported
+as partial totals. It does not recursively scan subfolders.
+
+The existing destination picker now previews the exact target paths, selected
+item count, recursive file/folder counts, total size, and existing-name conflicts.
+Remote copies check names in the selected remote folder without writing there.
+The transfer button is enabled after a successful, conflict-free preview; use
+**Check again** to refresh it. Changing remote subfolders refreshes the preview.
+A changed folder configuration invalidates the preview before queuing. The worker
+still checks current paths, conflicts, and space when the job actually runs.
+
 Open **Recent transfers** from the directory header to review your queued,
 running, completed, failed, and cancelled jobs. Job history is private to the
 signed-in user and is removed according to `JOB_HISTORY_DAYS`.
+Open **Operation log** to search recorded filenames, source/destination folders,
+failure reasons, and job IDs, with operation and outcome filters. Records show
+the user and UTC time, and include transfer queue/start/item results as well as
+uploads, deletes, renames, new folders, and archive operations. Results are paged
+50 at a time and show only the signed-in user's records.
+
+Logs are stored separately from job history in `JOB_DATA_DIR/operations.sqlite3`.
+Set `FILELIST_OPERATION_LOG` to use another database path. The worker prunes
+records older than `FILELIST_LOG_RETENTION_DAYS` (default 30) at startup and daily.
+A logging failure is reported in the application log without undoing or retrying
+a successful file operation. Existing transfers are not backfilled into the log.
 Failed and cancelled jobs can be retried from this screen. Active transfers show
 their current rate and a rough remaining-time estimate once progress is available.
+Active jobs appear before finished history. Pending jobs show their global queue
+position and the number of jobs ahead, including the current transfer. This uses
+the same creation-time order as the worker. **Cancel pending** removes a waiting
+job before it starts; **Request cancellation** asks the worker to stop an active
+job. The page shows **Cancellation requested** until it stops. Use **Refresh queue**
+for an updated history view; the live transfer panel updates while polling.
+
+The folder page and Recent transfers show a worker-health indicator, refreshed
+every ten seconds. It distinguishes ready, working, starting, stopped, missing/
+unresponsive heartbeat, and a worker that may be stalled. The worker writes a
+heartbeat every two seconds and records main-loop checkpoints separately, so a
+background heartbeat cannot mask a blocked transfer loop. A pulse older than
+`FILELIST_WORKER_STALE_SECONDS` (default 15) is unresponsive; no main-loop activity
+for `FILELIST_WORKER_STALL_SECONDS` (default 120) while working suggests a stall.
+Slow storage or an external tool may also explain this state. These are diagnostic
+signals: they never restart the worker, cancel transfers, or alter queued work.
+Restart both processes after upgrading so the worker begins publishing health.
+Both the live panel and Recent transfers list completed, failed, and unstarted
+items separately. **Retry remaining** retries failed and unstarted items while
+keeping completed items. Terminal results stay visible until you choose to refresh
+the file list; the live panel remembers the ten most recent terminal job IDs and
+fetches their details with the normal account checks.
 
 Copy, move, and remote-copy jobs record each fully completed item. Retrying creates
 a new job containing only the unfinished items, so completed files do not block
 the remaining selection. Progress on the new job covers that remaining selection.
 Retries recheck current directory and remote-destination permissions; local workers
 also recheck permissions before executing a job.
+
+New jobs record stable directory IDs and the original resolved roots. Reordering
+directory configuration does not change a queued job's source or destination.
+Removing a directory or changing its root stops the job with an explanation.
+Older jobs that store only list positions cannot be safely mapped after an
+upgrade: submit those operations again from the file list, rather than retrying
+their old history entries. Restart both Flask and the worker when upgrading.
 
 Completion records are conservative: old jobs without per-item records, or a crash
 between publishing a file and saving its completion record, may still require manual
@@ -245,6 +397,10 @@ to the server; **Uploaded** appears only after the server confirms success. Fail
 entries remain visible and offer **Retry upload**. Use **Refresh file list** when
 ready to refresh; completing another upload does not clear earlier errors. After
 a network error, check whether the file arrived before retrying to avoid duplicates.
+Uploads stream to temporary files and publish only after a successful write.
+Concurrent uploads with the same name receive distinct numbered filenames; the
+upload result shows the actual saved name. Read, write, size-limit, and publication
+failures remove the temporary upload without changing existing files.
 
 `/health` is an unauthenticated JSON liveness endpoint for a reverse proxy or
 monitor. Signed-in users can open **Configuration** to see only directories and
@@ -256,9 +412,20 @@ that list. Remote settings continue to be read from disk when used, and the work
 reads directory configuration when it starts each job.
 
 Archive extraction checks paths, links, entry count, total uncompressed size,
-and available space before writing files. Uploads, video conversion, and remote
+and available space before writing files. Archive creation validates every
+source and rejects symbolic links, junctions, and special files. Creation and
+extraction use temporary staging and never overwrite an existing destination.
+Choose a new archive name or rename the existing extraction folder to proceed.
+Failed operations clean up their staging data. Archives require Windows or Linux
+with atomic no-replace rename support; unsupported systems fail safely.
+Uploads, video conversion, and remote
 copy staging also reserve free space. The byte settings above show the defaults;
 raise them when the server needs a larger operating-space reserve.
+Local copies check capacity for the whole selection before writing, and staged
+copies recheck capacity for each item and each chunk. Cross-drive moves use the
+same checks before copying or removing the source. Same-drive moves rename files
+without requiring space for a second copy. Checks cannot reserve space against
+other processes, so a later disk-full error still fails safely and cleans staging.
 
 ## Copy to remote servers (Linux)
 
@@ -318,7 +485,8 @@ under that destination's configured `path`. fileList lists only folders below th
 configured root and records the selected path with the queued job. It never permits
 browsing or copying above the configured remote root.
 
-The Select All checkbox chooses only rows currently visible after filtering.
+The Select All checkbox chooses only rows on the current page, after searching.
+Selections do not carry across page navigation.
 
 Run the remote-copy regression checks with:
 

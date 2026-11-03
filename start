@@ -8,6 +8,11 @@ else
     PYTHON_BIN="${PYTHON_BIN:-python3}"
 fi
 
+"$PYTHON_BIN" tools/check_config.py --ssh
+if [[ "${1:-}" == "--check" ]]; then
+    exit 0
+fi
+
 worker_pid=""
 app_pid=""
 

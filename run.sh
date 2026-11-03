@@ -10,6 +10,7 @@ if [[ -r "$pid_file" ]] && kill -0 "$(cat "$pid_file")" 2>/dev/null; then
 fi
 
 rm -f "$pid_file"
+./start --check
 nohup ./start > run.log 2>&1 &
 pid=$!
 echo "$pid" > "$pid_file"

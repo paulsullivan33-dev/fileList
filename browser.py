@@ -4,6 +4,8 @@ import json
 import time
 import html
 import urllib.parse
+import folder_listing
+import worker_health
 
 from flask import abort, request, session
 from flask_wtf.csrf import generate_csrf
@@ -64,6 +66,23 @@ def _external_sites_html():
 
 def register(app, DIRECTORIES):
 
+    @app.route("/folder_stats")
+    def folder_stats():
+        index = safe_dir_index(request.args.get("dir"), DIRECTORIES, default=-1)
+        if index is None or not user_can_access_directory(DIRECTORIES[index], session.get("groups", [])):
+            abort(403)
+        path = request.args.get("path", "")
+        if not is_safe_path(path):
+            return {"success": False, "error": "Invalid folder path."}, 400
+        folder = safe_join(DIRECTORIES[index].root, path)
+        if folder is None:
+            return {"success": False, "error": "Invalid folder path."}, 400
+        try:
+            result = folder_listing.totals(folder)
+        except OSError as error:
+            return {"success": False, "error": f"Cannot calculate folder totals: {error}"}, 400
+        return {"success": True, **result, "size": format_size(result["bytes"])}
+
     @app.route("/")
     def index():
         user_groups = session.get("groups", [])
@@ -91,7 +110,9 @@ def register(app, DIRECTORIES):
                                      dir_index, "")
 
         try:
-            entries = sorted(os.listdir(full_path))
+            listing = folder_listing.page(full_path, request.args.get("page", 1), request.args.get("per_page", 100),
+                                          request.args.get("q", ""), request.args.get("sort", 1), request.args.get("order", "asc"))
+            entries = listing["entries"]
         except (FileNotFoundError, NotADirectoryError) as e:
             # The requested child no longer exists (or was replaced by a file).
             # Redirecting to the same path would repeat this error forever, so
@@ -108,14 +129,15 @@ def register(app, DIRECTORIES):
         dir_count = 0
         file_count = 0
 
-        for name in entries:
+        for entry in entries:
+            name = entry["name"]
             # Some Unix filesystems expose non-UTF-8 filename bytes as surrogate
             # code points. Encode links from the original filesystem bytes, but
             # use replacement characters anywhere text is rendered as UTF-8.
             encoded = urllib.parse.quote_from_bytes(os.fsencode(name))
             display_name = _display_name(name)
             item_path = os.path.join(full_path, name)
-            is_dir = os.path.isdir(item_path)
+            is_dir = entry["is_dir"]
             ext = os.path.splitext(name.lower())[1]
 
             if is_dir:
@@ -127,7 +149,9 @@ def register(app, DIRECTORIES):
             size_raw = 0
             mtime_display = ""
             try:
-                st = os.stat(item_path)
+                st = entry["stat"]
+                if st is None:
+                    raise OSError("Metadata unavailable")
                 size_raw = st.st_size
                 if not is_dir:
                     total_size += size_raw
@@ -185,7 +209,7 @@ def register(app, DIRECTORIES):
                 )
 
             convert_link = ""
-            if sys.platform.startswith("linux") and not is_dir and ext in {".avi", ".mpg", ".mpeg"}:
+            if sys.platform.startswith("linux") and not is_dir and ext in {".avi", ".mpg", ".mpeg", ".mkv"}:
                 convert_link = (
                     f" / <a href='#' class='convert-link' "
                     f"data-name='{html.escape(display_name, quote=True)}' "
@@ -313,12 +337,33 @@ def register(app, DIRECTORIES):
                 "</tr>"
             )
 
-        stats_html = (
-            f"<div class='stats'>"
-            f"📁 {dir_count} folders · 📄 {file_count} files · "
-            f"💾 {format_size(total_size)} total"
-            f"</div>"
-        )
+        def page_url(number, query=None):
+            return "/?" + urllib.parse.urlencode({"dir": dir_index, "path": path, "page": number,
+                "per_page": listing["page_size"], "q": listing["query"] if query is None else query,
+                "sort": listing["sort"], "order": listing["order"]})
+        navigation = "<nav class='listing-navigation' aria-label='Folder pages'>"
+        if listing["page"] > 1:
+            navigation += f"<a href='{html.escape(page_url(listing['page'] - 1), quote=True)}'>Previous</a> "
+        navigation += (f"<span>Page {listing['page']} of {listing['pages']} · "
+                       f"Showing {listing['start']}–{listing['end']} of {listing['total']}"
+                       + (" matches" if listing["query"] else " items") + "</span> ")
+        if listing["page"] < listing["pages"]:
+            navigation += f"<a href='{html.escape(page_url(listing['page'] + 1), quote=True)}'>Next</a> "
+        if listing["query"]:
+            navigation += f"<a href='{html.escape(page_url(1, ''), quote=True)}'>Clear search</a> "
+        navigation += (f"<span>· {dir_count} folders · {file_count} files · "
+                       f"{format_size(total_size)} in displayed files</span> "
+                       "<button type='button' onclick='loadFolderTotals(this)'>Calculate folder totals</button> "
+                       "<span id='folderTotals' aria-live='polite'></span> ")
+        fields = {"dir": dir_index, "path": path, "q": listing["query"],
+                  "sort": listing["sort"], "order": listing["order"]}
+        hidden_fields = "".join(f"<input type='hidden' name='{key}' value='{html.escape(str(value), quote=True)}'>"
+                                for key, value in fields.items())
+        navigation += ("<form method='get'>" + hidden_fields + "<label>Items per page <select name='per_page' onchange='this.form.submit()'>"
+                       + "".join(f"<option value='{size}' {'selected' if size == listing['page_size'] else ''}>{size}</option>"
+                                 for size in folder_listing.PAGE_SIZES) + "</select></label></form></nav>")
+        search_fields = "".join(f"<input type='hidden' name='{key}' value='{html.escape(str(value), quote=True)}'>"
+                               for key, value in {**fields, "per_page": listing["page_size"]}.items() if key != "q")
         external_sites_html = _external_sites_html()
 
         return (
@@ -330,6 +375,7 @@ def register(app, DIRECTORIES):
                f"<span style='color:white;'>Select Directory:</span> "
                f"{dir_tabs_html}"
                f"<a class='header-link' href='/jobs'>Recent transfers</a>"
+               f"<a class='header-link' href='/operations'>Operation log</a>"
                f"<a class='header-link' href='/configuration'>Configuration</a>"
                f"<span class='dark-toggle' onclick='toggleDark()'>🌓 Theme</span>"
                f"<form class='logout-form' method='post' action='/logout'>"
@@ -340,10 +386,8 @@ def register(app, DIRECTORIES):
             + f"<input type='hidden' id='currentDir' value='{dir_index}'>"
             + f"<input type='hidden' id='currentPath' value='{html.escape(path, quote=True)}'>"
             + f"<input type='hidden' id='csrfToken' value='{generate_csrf()}'>"
-            + stats_html
+            + worker_health.banner() + navigation
             + f"""
-            <div id='dropZone' role='button' tabindex='0' aria-controls='uploadInput'>⬆️ Drop files here or click to upload</div>
-            <input type='file' id='uploadInput' multiple />
             <div id='uploadQueue' aria-live='polite'></div>
 
             <div class='toolbar'>
@@ -351,13 +395,20 @@ def register(app, DIRECTORIES):
                 <button class='toolbar-btn' onclick='createArchiveDialog()'>🗜️ Archive</button>
                 <button class='toolbar-btn danger' onclick='bulkDelete()'>🗑️ Delete Selected</button>
                 <button class='toolbar-btn' onclick='bulkMove()'>📦 Move Selected</button>
-                <input id='searchInput' type='search' placeholder='🔍 Filter files...' aria-label='Filter files'>
+                <div id='dropZone' role='button' tabindex='0' aria-controls='uploadInput'>⬆️ Drop files or click to upload</div>
+                <input type='file' id='uploadInput' multiple />
+                <form id='listingSearch' method='get' onsubmit='filterTable(event)'>
+                    {search_fields}
+                    <input id='searchInput' name='q' type='search' value='{html.escape(listing["query"], quote=True)}'
+                           placeholder='Search this folder...' aria-label='Search all filenames in this folder'>
+                    <button type='submit'>Search</button>
+                </form>
             </div>
 
             <table class='table' id='fileTable'>
             <thead>
             <tr>
-                <th><input type='checkbox' onclick='toggleAll(this)'></th>
+                <th><input type='checkbox' title='Select all items on this page' onclick='toggleAll(this)'></th>
                 <th class='sortable' data-sort-col='1' onclick='sortTable(1)'>Name <span class='sort-indicator'></span></th>
                 <th class='preview-col'>Preview</th>
                 <th class='sortable size' data-sort-col='3' onclick='sortTable(3)'>Size <span class='sort-indicator'></span></th>
@@ -369,10 +420,10 @@ def register(app, DIRECTORIES):
             {rows_html}
             </tbody>
             </table>
-            <div class='statusbar' id='statusbar'></div>
+            <div class='statusbar' id='statusbar'>Selection is limited to this page.</div>
             <div id='jobsPanel'></div>
             """
-            + _inline_scripts()
+            + navigation + _inline_scripts()
         )
 
 
@@ -427,7 +478,12 @@ function activeJobs() {
 }
 
 function saveJobs(jobs) {
-    localStorage.setItem(JOB_KEY, JSON.stringify(jobs));
+    // Persist identifiers only; names and errors are fetched with owner checks.
+    const active = jobs.filter(job => !['complete', 'failed', 'cancelled'].includes(job.status));
+    const recent = jobs.filter(job => ['complete', 'failed', 'cancelled'].includes(job.status)).slice(-10);
+    localStorage.setItem(JOB_KEY, JSON.stringify([...active, ...recent].map(
+        ({job_id, operation, status}) => ({job_id, operation, status})
+    )));
 }
 
 function rememberJob(job) {
@@ -457,6 +513,12 @@ function showJob(job) {
     row.textContent = `${(job.operation || 'job').replaceAll('_', ' ')}: ${job.status}` +
         (job.progress_unit === 'items' ? ` (${completed}/${total} items)` :
             (percent === null ? '' : ` (${percent}%)`)) + ' ';
+    if (job.status === 'pending' && job.queue_position != null) {
+        row.appendChild(document.createTextNode(`Queued #${job.queue_position} · ${job.jobs_ahead} job(s) ahead. `));
+    }
+    if (job.cancellation_requested && job.status === 'running') {
+        row.appendChild(document.createTextNode('Cancellation requested. '));
+    }
     if (job.error) row.appendChild(document.createTextNode(job.error + ' '));
     if (job.bytes_per_second) {
         const eta = job.seconds_remaining == null ? '' : ` · about ${Math.ceil(job.seconds_remaining)}s left`;
@@ -465,17 +527,51 @@ function showJob(job) {
     if (job.remote_partial_path && ['failed', 'cancelled'].includes(job.status)) {
         row.appendChild(document.createTextNode('Partial remote copy: ' + job.remote_partial_path + ' '));
     }
+    const itemTotal = ['completed_names', 'failed_names', 'remaining_names']
+        .reduce((sum, key) => sum + (Array.isArray(job[key]) ? job[key].length : 0), 0);
+    for (const [label, key] of [['Completed', 'completed_names'], ['Failed', 'failed_names'], ['Remaining', 'remaining_names']]) {
+        // Skip empty sections, and skip the lists entirely for a one-item
+        // job (e.g. a single-file conversion): the status line and the
+        // in-progress name already say everything there is to say.
+        if (!Array.isArray(job[key]) || job[key].length === 0 || itemTotal <= 1) continue;
+        const details = document.createElement('details');
+        const summary = document.createElement('summary');
+        summary.textContent = `${label} (${job[key].length})`;
+        details.appendChild(summary);
+        const list = document.createElement('ul');
+        for (const name of job[key]) {
+            const item = document.createElement('li'); item.textContent = name;
+            list.appendChild(item);
+        }
+        details.appendChild(list); row.appendChild(details);
+    }
+    if (job.current_name) row.appendChild(document.createTextNode('In progress: ' + job.current_name + ' '));
+    if (job.requires_resubmit) {
+        row.appendChild(document.createTextNode('Select the remaining files and start a new transfer; this older transfer cannot be retried safely. '));
+    }
     if (['pending', 'running'].includes(job.status)) {
         const cancel = document.createElement('button');
-        cancel.type = 'button'; cancel.textContent = 'Cancel';
-        cancel.onclick = () => cancelJob(job.job_id);
+        cancel.type = 'button'; cancel.textContent = job.cancellation_requested ? 'Cancellation requested' : 'Cancel';
+        cancel.disabled = !!job.cancellation_requested;
+        cancel.onclick = () => cancelJob(job.job_id, cancel);
         row.appendChild(cancel);
     }
-    if (['failed', 'cancelled'].includes(job.status)) {
+    if (['failed', 'cancelled'].includes(job.status) && job.can_retry !== false) {
         const retry = document.createElement('button');
-        retry.type = 'button'; retry.textContent = 'Retry';
+        retry.type = 'button'; retry.textContent = 'Retry remaining' + (job.retry_count == null ? '' : ` (${job.retry_count})`);
+        retry.title = 'Retry failed and unstarted items; keep completed items';
         retry.onclick = () => retryJob(job.job_id, retry);
         row.appendChild(retry);
+    }
+    if (['complete', 'failed', 'cancelled'].includes(job.status)) {
+        const dismiss = document.createElement('button');
+        dismiss.type = 'button'; dismiss.textContent = '×';
+        dismiss.title = 'Dismiss';
+        dismiss.onclick = () => forgetJob(job.job_id);
+        row.appendChild(dismiss);
+        const refresh = document.createElement('button');
+        refresh.type = 'button'; refresh.textContent = 'Refresh file list';
+        refresh.onclick = () => location.reload(); row.appendChild(refresh);
     }
 }
 
@@ -508,13 +604,21 @@ async function retryJob(jobId, button = null) {
     }
 }
 
-async function cancelJob(jobId) {
-    const response = await csrfFetch('/job_cancel', {
-        method: 'POST', headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify({job_id: jobId})
-    });
-    const data = await response.json().catch(() => ({}));
-    if (!data.success) alert('Cancellation failed: ' + (data.error || response.status));
+async function cancelJob(jobId, button = null) {
+    const original = button?.textContent || 'Cancel';
+    if (button) { button.disabled = true; button.textContent = 'Requesting cancellation…'; }
+    try {
+        const response = await csrfFetch('/job_cancel', {
+            method: 'POST', headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({job_id: jobId})
+        });
+        const data = await response.json().catch(() => ({}));
+        if (!response.ok || !data.success) throw new Error(data.error || 'Cancellation failed');
+        if (button) button.textContent = data.status === 'cancelled' ? 'Cancelled' : data.cancellation_requested ? 'Cancellation requested' : 'Transfer finished';
+    } catch (error) {
+        if (button) { button.disabled = false; button.textContent = original; }
+        alert('Cancellation could not be confirmed. Refresh the queue before trying again. ' + error.message);
+    }
 }
 
 async function pollJob(jobId, trigger = null) {
@@ -528,16 +632,18 @@ async function pollJob(jobId, trigger = null) {
         }
         showJob(data);
         if (data.status === 'complete') {
-            forgetJob(jobId);
+            rememberJob(data);
             flash(`${data.operation} complete`);
             if (trigger) trigger.textContent = 'Converted';
-            setTimeout(() => location.reload(), 800);
+            // A finished popup should not hold screen space: dismiss it
+            // shortly after completion (the × button dismisses it sooner,
+            // and the job stays in Recent transfers either way).
+            setTimeout(() => forgetJob(jobId), 5000);
             return;
         }
         if (data.status === 'failed' || data.status === 'cancelled') {
-            forgetJob(jobId);
+            rememberJob(data);
             if (trigger) trigger.textContent = 'Convert to MP4';
-            alert(`${data.operation} ${data.status}: ` + (data.error || 'No details'));
             return;
         }
         if (trigger) trigger.textContent = data.status === 'pending' ? 'Queued…' : 'Converting…';
@@ -580,41 +686,14 @@ function toggleDark() {
 // -----------------------------------------------------------------
 function sortTable(col) {
     const nextDir = (state.sortCol === col && state.sortDir === 'asc') ? 'desc' : 'asc';
-    applySort(col, nextDir);
+    const url = new URL(window.location.href);
+    url.searchParams.set('sort', col); url.searchParams.set('order', nextDir);
+    url.searchParams.set('page', '1'); window.location.assign(url);
 }
 
 function applySort(col, dir) {
-    const tbody = document.querySelector('#fileTable tbody');
-    const rows = Array.from(tbody.querySelectorAll('tr'));
-    state.sortCol = col;
-    state.sortDir = dir;
-    saveState();
-    const url = new URL(window.location.href);
-    url.searchParams.set('sort', col);
-    url.searchParams.set('order', dir);
-    history.replaceState(null, '', url);
+    state.sortCol = col; state.sortDir = dir; saveState();
     carrySortInLinks(col, dir);
-
-    const isDir = r => r.dataset.isdir === '1';
-    const cell = (r, i) => r.cells[i] || {dataset: {sort: ''}, textContent: ''};
-    const get = r => (cell(r, col).dataset.sort || cell(r, col).textContent || '').toLowerCase();
-    const isNum = !isNaN(parseFloat(get(rows[0]))) && isFinite(get(rows[0]));
-
-    rows.sort((a, b) => {
-        if (a.dataset.name === '..') return -1;
-        if (b.dataset.name === '..') return  1;
-        if (isDir(a) !== isDir(b)) return isDir(a) ? -1 : 1;
-        const av = get(a), bv = get(b);
-        if (isNum) {
-            return dir === 'asc' ? parseFloat(av) - parseFloat(bv)
-                                  : parseFloat(bv) - parseFloat(av);
-        }
-        if (av < bv) return dir === 'asc' ? -1 : 1;
-        if (av > bv) return dir === 'asc' ?  1 : -1;
-        return 0;
-    });
-
-    rows.forEach(r => tbody.appendChild(r));
     document.querySelectorAll('[data-sort-col]').forEach(header => {
         const active = Number(header.dataset.sortCol) === col;
         header.classList.toggle('sorted', active);
@@ -624,39 +703,38 @@ function applySort(col, dir) {
     });
 }
 
-// The URL is the only place the sort is kept, so folder, breadcrumb and
-// directory-tab links carry it forward. The filter is deliberately not
-// carried: it applies to the folder it was typed in.
 function carrySortInLinks(col, dir) {
+    const current = new URL(window.location.href);
     document.querySelectorAll('a[href^="/?"]').forEach(link => {
         const url = new URL(link.getAttribute('href'), window.location.origin);
-        url.searchParams.set('sort', col);
-        url.searchParams.set('order', dir);
+        url.searchParams.set('sort', col); url.searchParams.set('order', dir);
+        if (current.searchParams.has('per_page')) url.searchParams.set('per_page', current.searchParams.get('per_page'));
         link.setAttribute('href', url.pathname + url.search);
     });
 }
 
-// -----------------------------------------------------------------
-// Filtering
-// -----------------------------------------------------------------
-function filterTable() {
-    const q = document.getElementById('searchInput').value.trim().toLowerCase();
+function filterTable(event) {
+    if (event) event.preventDefault();
     const url = new URL(window.location.href);
-    if (q) url.searchParams.set('q', q); else url.searchParams.delete('q');
-    if (state.sortCol !== undefined) {
-        url.searchParams.set('sort', state.sortCol);
-        url.searchParams.set('order', state.sortDir);
-    }
-    history.replaceState(null, '', url);
-    let shown = 0;
-    document.querySelectorAll('#fileTable tbody tr').forEach(r => {
-        const name = (r.dataset.name || '').toLowerCase();
-        const match = name.includes(q);
-        r.style.display = match ? '' : 'none';
-        if (match && r.dataset.name !== '..') shown++;
-    });
-    const sb = document.getElementById('statusbar');
-    if (sb) sb.textContent = q ? `Showing ${shown} match(es) for "${q}"` : '';
+    const query = document.getElementById('searchInput').value.trim();
+    if (query) url.searchParams.set('q', query); else url.searchParams.delete('q');
+    url.searchParams.set('page', '1'); window.location.assign(url);
+}
+
+async function loadFolderTotals(button) {
+    const output = document.getElementById('folderTotals');
+    button.disabled = true; output.textContent = 'Calculating…';
+    try {
+        const query = new URLSearchParams({dir: document.getElementById('currentDir').value,
+                                         path: document.getElementById('currentPath').value});
+        const response = await fetch('/folder_stats?' + query);
+        const data = await response.json().catch(() => ({}));
+        if (!response.ok || !data.success) throw new Error(data.error || 'Could not calculate totals');
+        output.textContent = `Folder totals (direct contents): ${data.folders} folders · ${data.files} files · ${data.size}` +
+            (data.unavailable ? ` · ${data.unavailable} unavailable entries; totals are partial` : '');
+        button.textContent = 'Recalculate totals';
+    } catch (error) { output.textContent = error.message; }
+    finally { button.disabled = false; }
 }
 
 // -----------------------------------------------------------------
@@ -981,7 +1059,8 @@ function uploadOne(file, row, dir, path) {
             if (xhr.status >= 200 && xhr.status < 300 && data.success) {
                 progress.value = 100;
                 percent.textContent = '100%';
-                result.textContent = 'Uploaded';
+                const savedName = data.saved?.[0]?.name;
+                result.textContent = savedName && savedName !== file.name ? `Uploaded as ${savedName}` : 'Uploaded';
                 result.className = 'upload-result success';
                 resolve(true);
             } else {
@@ -1077,10 +1156,6 @@ window.addEventListener('DOMContentLoaded', () => {
     } else {
         applySort(1, 'asc');
     }
-    if (q && q.value) filterTable();
-    q?.addEventListener('input', () => {
-        filterTable();
-    });
     dropZone.addEventListener('keydown', e => {
         if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); fileInput.click(); }
     });

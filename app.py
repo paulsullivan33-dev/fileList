@@ -7,16 +7,15 @@ import auth
 import browser
 import actions
 import uploads
+from tools.check_config import require_startup
 
 
 def create_app():
     app = Flask(__name__)
+    require_startup(config_loader.CONFIG_FILE, os.path.join(app.root_path, "users.json"))
     DIRECTORIES = config_loader.load_directories()
     auth.register(app, DIRECTORIES)
     CSRFProtect(app)
-
-    for root, _ in DIRECTORIES:
-        os.makedirs(root, exist_ok=True)
 
     browser.register(app, DIRECTORIES)
     actions.register(app, DIRECTORIES)

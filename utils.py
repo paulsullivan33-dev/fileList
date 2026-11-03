@@ -3,6 +3,7 @@ import json
 import html
 import urllib.parse
 import shutil
+from contextlib import contextmanager
 
 IMAGE_EXT = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".svg"}
 ARCHIVE_EXT = {".zip", ".tar", ".gz", ".tgz", ".7z"}
@@ -41,15 +42,13 @@ def ensure_free_space(directory, required_bytes, reserve_bytes=None):
 # -------------------------------------------------------------------
 def is_safe_segment(s):
     """A single path segment (no separators, no traversal)."""
-    if s is None or s == "":
+    if not isinstance(s, str) or s in {"", ".", ".."}:
         return False
     if s.startswith("/") or s.startswith("\\"):
         return False
     if ":" in s:
         return False
-    if ".." in s:
-        return False
-    if "\\" in s or "\x00" in s:
+    if "/" in s or "\\" in s or "\x00" in s:
         return False
     if "／" in s or "＼" in s:
         return False
@@ -83,12 +82,21 @@ def safe_join(root, *parts):
 # -------------------------------------------------------------------
 def warn_and_redirect(css_js, msg, dir_index=0, path=""):
     safe_path = urllib.parse.quote(path or "")
-    safe_msg = json.dumps(msg)
+    safe_msg = json.dumps(msg).replace("<", "\\u003c")
     return (
         css_js
         + f"<script>alert({safe_msg});"
         f"window.location='/?dir={dir_index}&path={safe_path}';</script>"
     )
+
+
+@contextmanager
+def transfer_item(name):
+    """Keep the selected item in worker errors, including terse tool errors."""
+    try:
+        yield
+    except (OSError, RuntimeError, ValueError) as error:
+        raise RuntimeError(f"Transfer failed for {name!r}: {error}") from error
 
 
 def format_size(num):
@@ -161,8 +169,38 @@ def current_user_groups(username, users_path=None):
     return []
 
 
+def resolve_job_directory(selection, directories):
+    """Never reinterpret a durable job's old list position as a new folder."""
+    identifier = selection.get("directory_id")
+    root = selection.get("directory_root")
+    if not identifier or not root:
+        raise ValueError("This older job has no stable folder identity; submit the operation again.")
+    matches = [(index, directory) for index, directory in enumerate(directories)
+               if directory.stable_id == identifier]
+    if len(matches) != 1:
+        raise ValueError("A folder required by this job was removed or its identity changed; submit the operation again.")
+    index, directory = matches[0]
+    if os.path.normcase(os.path.realpath(directory.root)) != root:
+        raise ValueError("A folder root changed since this job was submitted; submit the operation again.")
+    return index
+
+
+def bind_job_selection(selection, directories):
+    selection = dict(selection)
+    if "directory_id" in selection or "directory_root" in selection:
+        index = resolve_job_directory(selection, directories)
+    else:
+        index = safe_dir_index(selection.get("directory_index"), directories, default=-1)
+        if index is None:
+            raise ValueError("Invalid job directory.")
+    directory = directories[index]
+    selection.update(directory_index=index, directory_id=directory.stable_id,
+                     directory_root=os.path.normcase(os.path.realpath(directory.root)))
+    return selection
+
+
 def authorize_job(job, directories, groups):
-    """Authorize stored job indices rather than trusting request parameters."""
+    """Resolve immutable folder references before checking current grants."""
     operation = job.get("operation")
     if operation not in {"copy", "move", "convert", "remote_copy"}:
         raise ValueError("Unknown job operation.")
@@ -170,8 +208,8 @@ def authorize_job(job, directories, groups):
     if operation in {"copy", "move"}:
         selections.append(job["destination"])
     for selection in selections:
-        index = safe_dir_index(selection.get("directory_index"), directories, default=-1)
-        if index is None or not user_can_access_directory(directories[index], groups):
+        index = resolve_job_directory(selection, directories)
+        if not user_can_access_directory(directories[index], groups):
             raise PermissionError("You cannot access a directory required by this job.")
     if operation == "remote_copy":
         import remote_copy

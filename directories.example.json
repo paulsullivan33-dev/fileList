@@ -1,5 +1,6 @@
 [
   {
+    "id": "storage",
     "root": "/srv/filelist/storage",
     "url": "https://files.example.com/storage",
     "name": "Storage",

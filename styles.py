@@ -80,14 +80,13 @@ body { font-family: system-ui, sans-serif; margin: 20px; }
 
 #dropZone {
     border: 1px dashed #888;
-    padding: 8px 12px;
-    text-align: left;
-    border-radius: 6px;
-    margin: 6px 0 10px;
+    padding: 8px 14px;
+    border-radius: 4px;
     font-size: 13px;
     color: #888;
     transition: all 0.15s ease;
     cursor: pointer;
+    white-space: nowrap;
 }
 #dropZone.dragover {
     border-color: #4caf50;
@@ -304,6 +303,15 @@ html.dark-mode .table .row-dir .filename a:visited { color: #9fe3a7; }
 html.dark-mode .table .row-parent .filename a,
 html.dark-mode .table .row-parent .filename a:visited { color: #c4cbd3; }
 html.dark-mode .table .filename a:hover { color: #ffffff; text-decoration: underline; }
+.transfer-preview { margin: 14px 0; padding: 12px; border: 1px solid #8886; border-radius: 6px; overflow-wrap: anywhere; }
+.listing-navigation { display: flex; align-items: center; flex-wrap: wrap; gap: 12px; margin: 12px 0; }
+.listing-navigation form, #listingSearch { display: inline-flex; align-items: center; gap: 8px; margin: 0; }
+.worker-health { margin: 12px 0; padding: 10px; border: 1px solid #8886; border-radius: 6px; }
+.worker-health[hidden] { display: none; }
+.worker-health[data-state='stopped'], .worker-health[data-state='unresponsive'], .worker-health[data-state='stalled'] { border-color: #b7791f; }
+.transfer-conflict { color: #ba2828; font-weight: 600; }
+html.dark-mode .transfer-conflict { color: #ffaaaa; }
+button:disabled { opacity: .55; cursor: not-allowed; }
 </style>
 
 <script>

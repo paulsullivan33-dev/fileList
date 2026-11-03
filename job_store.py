@@ -2,6 +2,7 @@ import json
 import os
 import secrets
 import tempfile
+import operation_log
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -78,11 +79,16 @@ def find(job_id):
     return None, None
 
 
-def create(operation, owner, source, destination):
+def create(operation, owner, source, destination, directories=None):
+    if directories is not None:
+        from utils import bind_job_selection
+        source = bind_job_selection(source, directories)
+        if operation in {"copy", "move", "convert"}:
+            destination = bind_job_selection(destination, directories)
     initialize()
     job_id = secrets.token_hex(16)
     record = {
-        "version": 1,
+        "version": 2 if "directory_id" in source else 1,
         "job_id": job_id,
         "operation": operation,
         "owner": owner,
@@ -92,12 +98,15 @@ def create(operation, owner, source, destination):
         "bytes_total": 0,
         "bytes_completed": 0,
         "completed_names": [],
+        "failed_names": [],
+        "current_name": None,
         "created_at": utc_now(),
         "started_at": None,
         "finished_at": None,
         "error": None,
     }
     _atomic_write(_job_path("pending", job_id), record)
+    operation_log.record_job(record, "queued")
     return record
 
 
@@ -117,13 +126,13 @@ def pending_count(owner=None):
 
 
 def history(owner, limit=50):
-    """Return an owner's newest durable jobs, including completed history."""
+    """Keep active jobs visible before an owner's recent terminal history."""
     initialize()
     try:
         limit = max(1, min(int(limit), 200))
     except (TypeError, ValueError):
         limit = 50
-    records = []
+    records = {}
     for state in STATES:
         for path in (job_root() / state).glob("*.json"):
             try:
@@ -131,12 +140,42 @@ def history(owner, limit=50):
             except (OSError, json.JSONDecodeError):
                 continue
             if job.get("owner") == owner:
-                records.append(job)
-    records.sort(
-        key=lambda job: job.get("finished_at") or job.get("started_at") or job.get("created_at") or "",
-        reverse=True,
-    )
-    return records[:limit]
+                job["status"] = state
+                records[job.get("job_id", path.stem)] = job
+    records = list(records.values())
+    active = [job for job in records if job.get("status") in {"pending", "running"}]
+    finished = [job for job in records if job.get("status") not in {"pending", "running"}]
+    active.sort(key=lambda job: (job.get("status") != "running", job.get("created_at", ""), job.get("job_id", "")))
+    finished.sort(key=lambda job: job.get("finished_at") or job.get("created_at") or "", reverse=True)
+    return (active + finished)[:limit]
+
+
+def _pending_entries():
+    initialize()
+    entries = []
+    for path in (job_root() / "pending").glob("*.json"):
+        try:
+            job = read_path(path)
+            if isinstance(job, dict):
+                entries.append((job, path))
+        except (OSError, json.JSONDecodeError):
+            continue
+    return sorted(entries, key=lambda entry: (entry[0].get("created_at", ""), entry[1].name))
+
+
+def queue_snapshot(owner=None):
+    """Positions use exactly the worker's FIFO order, across all owners."""
+    pending = _pending_entries()
+    running = 0
+    for path in (job_root() / "running").glob("*.json"):
+        try:
+            read_path(path)
+            running += 1
+        except (OSError, json.JSONDecodeError):
+            continue
+    return {job["job_id"]: {"queue_position": index + 1, "jobs_ahead": index + running,
+                             "waiting_for_running_job": bool(running)}
+            for index, (job, _) in enumerate(pending) if owner is None or job.get("owner") == owner}
 
 
 def has_active_destination(destination):
@@ -144,7 +183,12 @@ def has_active_destination(destination):
     for state in ("pending", "running"):
         for path in (job_root() / state).glob("*.json"):
             try:
-                if read_path(path).get("destination") == destination:
+                stored = dict(read_path(path).get("destination") or {})
+                candidate = dict(destination)
+                if "directory_id" in stored and "directory_id" in candidate:
+                    stored.pop("directory_index", None)
+                    candidate.pop("directory_index", None)
+                if stored == candidate:
                     return True
             except (OSError, json.JSONDecodeError):
                 continue
@@ -152,9 +196,7 @@ def has_active_destination(destination):
 
 
 def claim_next():
-    initialize()
-    pending = sorted((job_root() / "pending").glob("*.json"), key=lambda p: p.stat().st_mtime)
-    for source in pending:
+    for _, source in _pending_entries():
         target = job_root() / "running" / source.name
         try:
             os.replace(source, target)
@@ -163,6 +205,7 @@ def claim_next():
         job = read_path(target)
         job.update(status="running", started_at=utc_now())
         _atomic_write(target, job)
+        operation_log.record_job(job, "running")
         return job, target
     return None, None
 
@@ -174,25 +217,57 @@ def update(path, **changes):
     return job
 
 
+def start_item(path, name):
+    update(path, current_name=name)
+
+
 def complete_item(path, name):
     """Persist only items whose transfer has fully succeeded."""
     job = read_path(path)
     completed = job.setdefault("completed_names", [])
+    newly_completed = name not in completed
     if name not in completed:
         completed.append(name)
-        _atomic_write(path, job)
+    if job.get("current_name") == name:
+        job["current_name"] = None
+    _atomic_write(path, job)
+    if newly_completed:
+        operation_log.record_job(job, "complete", item=name)
+
+
+def item_summary(job):
+    """Separate failed items from unstarted items without guessing old errors."""
+    names = list(dict.fromkeys(job.get("source", {}).get("names", [])))
+    completed = [name for name in names
+                 if job.get("status") == "complete" or name in job.get("completed_names", [])]
+    failed = [name for name in names if name not in completed and name in job.get("failed_names", [])]
+    current = job.get("current_name") if job.get("status") == "running" else None
+    if current not in names or current in completed:
+        current = None
+    remaining = [name for name in names if name not in completed and name not in failed and name != current]
+    retry = [name for name in names if name not in completed]
+    selections = [job.get("source", {})]
+    if job.get("operation") in {"copy", "move"}:
+        selections.append(job.get("destination", {}))
+    stable = all(selection.get("directory_id") and selection.get("directory_root") for selection in selections)
+    return {"completed_names": completed, "failed_names": failed,
+            "remaining_names": remaining, "current_name": current,
+            "total_count": len(names), "retry_count": len(retry),
+            "can_retry": job.get("status") in {"failed", "cancelled"} and bool(retry) and bool(stable),
+            "requires_resubmit": bool(retry) and not stable}
 
 
 def retry_selection(job):
     """Keep completed items out of a retry without trusting destination existence."""
     source, destination = dict(job["source"]), dict(job["destination"])
-    if job["operation"] in {"copy", "move", "remote_copy"}:
+    if job["operation"] in {"copy", "move", "remote_copy", "convert"}:
         completed = set(job.get("completed_names", []))
         remaining = [name for name in source.get("names", []) if name not in completed]
         if not remaining:
             raise ValueError("All selected items already completed; there is nothing to retry.")
         source["names"] = remaining
-        destination["names"] = remaining
+        if job["operation"] != "convert":
+            destination["names"] = remaining
     return source, destination
 
 
@@ -200,6 +275,10 @@ def finish(path, state, error=None):
     if state not in {"complete", "failed", "cancelled"}:
         raise ValueError("Invalid final job state")
     job = read_path(path)
+    current = job.get("current_name")
+    if state == "failed" and current and current not in job.get("completed_names", []):
+        job["failed_names"] = [current]
+    job["current_name"] = None
     job.update(status=state, error=error, finished_at=utc_now())
     target = _job_path(state, job["job_id"])
     _atomic_write(target, job)
@@ -208,6 +287,7 @@ def finish(path, state, error=None):
     except FileNotFoundError:
         pass
     cancel_path(job["job_id"]).unlink(missing_ok=True)
+    operation_log.record_job(job, state, item=current if current not in job.get("completed_names", []) else "", detail=error)
     return job
 
 
@@ -223,17 +303,27 @@ def request_cancel(job_id, owner):
     job, path = find(job_id)
     if job is None or job.get("owner") != owner:
         return None
-    if job.get("status") == "pending":
+    # The state directory is authoritative during atomic claim/cancel moves;
+    # the JSON's status may briefly still say 'pending' after a worker claims it.
+    if path.parent.name == "pending":
         try:
             target = _job_path("cancelled", job_id)
             os.replace(path, target)
             job.update(status="cancelled", finished_at=utc_now(), error="Cancelled by user.")
             _atomic_write(target, job)
+            operation_log.record_job(job, "cancelled", detail="Cancelled by user.")
             return job
         except FileNotFoundError:
             job, path = find(job_id)
-    if job and job.get("status") == "running":
+    if job and path.parent.name == "running":
         cancel_path(job_id).touch(exist_ok=True)
+        latest, latest_path = find(job_id)
+        if latest is not None:
+            job, path = latest, latest_path
+            if path.parent.name not in {"pending", "running"}:
+                cancel_path(job_id).unlink(missing_ok=True)
+    if job:
+        job["status"] = path.parent.name
     return job
 
 

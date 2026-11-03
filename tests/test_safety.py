@@ -1,5 +1,6 @@
 """Safety and history regression tests."""
 import json
+import io
 import os
 import tempfile
 import unittest
@@ -13,6 +14,7 @@ import actions
 import auth
 import job_store
 import job_worker
+import operation_log
 import uploads
 import utils
 from config_loader import Directory
@@ -49,6 +51,10 @@ class SafetyTests(unittest.TestCase):
         uploads.register(self.app, self.directories)
         self.client = self.app.test_client()
 
+    def create_job(self, operation, owner, source, destination):
+        return job_store.create(operation, owner, source, destination,
+                                directories=self.directories if "directory_index" in source else None)
+
     def sign_in(self):
         with self.client.session_transaction() as session:
             session["username"] = "tester"
@@ -83,8 +89,8 @@ class SafetyTests(unittest.TestCase):
                 utils.ensure_free_space(self.files, 10, reserve_bytes=1)
 
     def test_recent_transfers_shows_only_the_signed_in_user(self):
-        job_store.create("remote_copy", "tester", {"names": ["a file.txt"]}, {})
-        job_store.create("remote_copy", "someone-else", {"names": ["private.txt"]}, {})
+        self.create_job("remote_copy", "tester", {"names": ["a file.txt"]}, {})
+        self.create_job("remote_copy", "someone-else", {"names": ["private.txt"]}, {})
         self.sign_in()
         response = self.client.get("/jobs")
         page = response.get_data(as_text=True)
@@ -93,7 +99,7 @@ class SafetyTests(unittest.TestCase):
         self.assertNotIn("private.txt", page)
 
     def test_failed_job_can_be_retried_only_by_its_owner(self):
-        job = job_store.create("copy", "tester", {"directory_index": 0, "path": "", "names": ["a file.txt"]},
+        job = self.create_job("copy", "tester", {"directory_index": 0, "path": "", "names": ["a file.txt"]},
                                {"directory_index": 0, "path": "", "names": ["a file.txt"]})
         claimed, path = job_store.claim_next()
         job_store.finish(path, "failed", "temporary error")
@@ -109,7 +115,7 @@ class SafetyTests(unittest.TestCase):
         self.assertEqual(response.get_json()["directories"][0]["name"], "Files")
 
     def test_retry_json_response_identifies_new_trackable_job(self):
-        job = job_store.create("copy", "tester", {"directory_index": 0, "path": "", "names": ["a file.txt"]},
+        job = self.create_job("copy", "tester", {"directory_index": 0, "path": "", "names": ["a file.txt"]},
                                {"directory_index": 0, "path": "", "names": ["a file.txt"]})
         _, path = job_store.claim_next()
         job_store.finish(path, "failed", "temporary error")
@@ -163,7 +169,7 @@ class SafetyTests(unittest.TestCase):
             Directory(str(self.files), "/files", "Files", "members"),
             Directory(str(target), "/target", "Target", "writers"),
         ]
-        return job_store.create(operation, "tester",
+        return self.create_job(operation, "tester",
             {"directory_index": 0, "path": "", "names": ["a file.txt"]},
             {"directory_index": 1, "path": "", "names": ["a file.txt"]})
 
@@ -285,7 +291,7 @@ class SafetyTests(unittest.TestCase):
                 target.mkdir(exist_ok=True)
                 self.directories[:] = [Directory(str(self.files), "/files", "Files", "members"),
                                        Directory(str(target), "/target", "Target", "members")]
-                job = job_store.create(operation, "tester",
+                job = self.create_job(operation, "tester",
                     {"directory_index": 0, "path": "", "names": [first, second]},
                     {"directory_index": 1, "path": "", "names": [first, second]})
                 original_check = job_worker._check_cancel
@@ -336,6 +342,140 @@ class SafetyTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "nothing to retry"):
             job_store.retry_selection(old)
         self.assertEqual(job_store.pending_count("tester"), 0)
+
+
+    def test_consecutive_periods_are_names_not_traversal(self):
+        for name in ("report..pdf", "release...mkv", "..hidden.txt"):
+            self.assertTrue(utils.is_safe_segment(name), name)
+            self.assertTrue(utils.is_safe_path(f"folder..name/{name}"), name)
+        for name in (".", "..", "../outside", "folder/name", "folder\\name", None):
+            self.assertFalse(utils.is_safe_segment(name), repr(name))
+        for path in ("../outside", "folder/../outside", "folder/./file"):
+            self.assertFalse(utils.is_safe_path(path), path)
+
+    def test_copy_and_move_double_period_names_through_routes_and_worker(self):
+        target = self.root / "target"
+        target.mkdir()
+        self.directories.append(Directory(str(target), "/target", "Target", "members"))
+        for operation, route in (("copy", "/copy"), ("move", "/move_do")):
+            name = f"{operation}..txt"
+            (self.files / name).write_text("contents", encoding="utf-8")
+            self.sign_in()
+            response = self.client.post(route, data={
+                "src_dir": 0, "src_path": "", "src_name": name,
+                "dest_dir": 1, "dest_path": "",
+            })
+            self.assertEqual(response.status_code, 200)
+            self.assertEqual(job_store.pending_count("tester"), 1)
+            with patch.object(job_worker.config_loader, "load_directories", return_value=self.directories), \
+                    patch.object(job_worker, "current_user_groups", return_value=["members"]):
+                self.assertTrue(job_worker.run_once())
+            self.assertEqual((target / name).read_text(), "contents")
+            self.assertEqual((self.files / name).exists(), operation == "copy")
+
+    def test_worker_failure_names_item_and_preserves_completed_items(self):
+        target = self.root / "target"
+        target.mkdir()
+        self.directories.append(Directory(str(target), "/target", "Target", "members"))
+        names = ["first..txt", "failed..txt", "unstarted..txt"]
+        for name in names:
+            (self.files / name).write_text(name, encoding="utf-8")
+        job = self.create_job("copy", "tester",
+            {"directory_index": 0, "path": "", "names": names},
+            {"directory_index": 1, "path": "", "names": names})
+        original = job_worker._copy_staged
+        def fail_second(source, destination, progress):
+            if os.path.basename(source) == names[1]:
+                raise OSError("Disk full")
+            return original(source, destination, progress)
+        with patch.object(job_worker.config_loader, "load_directories", return_value=self.directories), \
+                patch.object(job_worker, "current_user_groups", return_value=["members"]), \
+                patch.object(job_worker, "_copy_staged", side_effect=fail_second):
+            self.assertTrue(job_worker.run_once())
+        stored, _ = job_store.find(job["job_id"])
+        self.assertEqual(stored["status"], "failed")
+        self.assertIn(names[1], stored["error"])
+        self.assertIn("Disk full", stored["error"])
+        self.assertEqual(stored["completed_names"], [names[0]])
+        self.sign_in()
+        response = self.client.get("/job_status", query_string={"job_id": job["job_id"]})
+        data = response.get_json()
+        self.assertIn(names[1], data["error"])
+        self.assertEqual(data["completed_names"], [names[0]])
+        self.assertEqual(data["failed_names"], [names[1]])
+        self.assertEqual(data["remaining_names"], [names[2]])
+        self.assertEqual(data["retry_count"], 2)
+        self.assertTrue(data["can_retry"])
+        page = self.client.get("/jobs").get_data(as_text=True)
+        self.assertIn("Completed (1)", page)
+        self.assertIn("Failed (1)", page)
+        self.assertIn("Remaining (1)", page)
+        self.assertIn("Retry remaining (2)", page)
+        (target / names[0]).write_text("keep completed", encoding="utf-8")
+        response = self.client.post("/job_retry", data={"job_id": job["job_id"]},
+                                    headers={"Accept": "application/json"})
+        self.assertEqual(response.status_code, 202)
+        retry, _ = job_store.find(response.get_json()["job_id"])
+        self.assertEqual(retry["source"]["names"], names[1:])
+        with patch.object(job_worker.config_loader, "load_directories", return_value=self.directories), \
+                patch.object(job_worker, "current_user_groups", return_value=["members"]):
+            self.assertTrue(job_worker.run_once())
+        self.assertEqual(job_store.find(retry["job_id"])[0]["status"], "complete")
+        self.assertEqual((target / names[0]).read_text(), "keep completed")
+        for name in names[1:]:
+            self.assertEqual((target / name).read_text(), name)
+
+    def test_filename_error_cannot_break_out_of_script(self):
+        self.sign_in()
+        response = self.client.get("/bulk_move", query_string={
+            "src_dir": 0, "name": "</script><script>alert(1)</script>",
+        })
+        self.assertNotIn("<script>alert(1)</script>", response.get_data(as_text=True))
+
+    def test_archive_routes_report_conflicts_without_overwriting(self):
+        self.sign_in()
+        response = self.client.post("/archive", json={
+            "dir": 0, "names": ["a file.txt"], "name": "backup", "type": "zip",
+        })
+        self.assertTrue(response.get_json()["success"])
+        original = (self.files / "backup.zip").read_bytes()
+        response = self.client.post("/archive", json={
+            "dir": 0, "names": ["a file.txt"], "name": "backup", "type": "zip",
+        })
+        self.assertEqual(response.status_code, 409)
+        self.assertIn("already exists", response.get_json()["error"])
+        self.assertEqual((self.files / "backup.zip").read_bytes(), original)
+        response = self.client.post("/extract", data={"dir": 0, "name": "backup.zip"})
+        self.assertEqual(response.status_code, 302)
+        extracted = self.files / "backup" / "a file.txt"
+        extracted.write_text("keep this version", encoding="utf-8")
+        response = self.client.post("/extract", data={"dir": 0, "name": "backup.zip"})
+        self.assertIn("already exists", response.get_data(as_text=True))
+        self.assertEqual(extracted.read_text(), "keep this version")
+
+    def test_operation_log_search_shows_upload_rename_and_delete_paths(self):
+        self.sign_in()
+        response = self.client.post("/upload", data={"dir": "0", "files": (io.BytesIO(b"data"), "new.txt")})
+        self.assertTrue(response.get_json()["success"])
+        self.assertTrue(self.client.post("/rename", json={"dir": 0, "old": "new.txt", "new": "renamed.txt"}).get_json()["success"])
+        self.assertEqual(self.client.post("/delete", data={"dir": 0, "name": "renamed.txt"}).status_code, 302)
+        page = self.client.get("/operations", query_string={"q": "renamed.txt"}).get_data(as_text=True)
+        self.assertIn("rename", page)
+        self.assertIn("delete", page)
+        self.assertIn("renamed.txt", page)
+        records = operation_log.search("tester")
+        self.assertEqual([record["operation"] for record in records], ["delete", "rename", "upload"])
+        self.assertTrue(records[1]["source"].endswith("new.txt"))
+        self.assertTrue(records[1]["destination"].endswith("renamed.txt"))
+
+    def test_operation_log_escapes_details_and_hides_other_users(self):
+        self.sign_in()
+        operation_log.record("tester", "copy", "failed", item="<script>alert(1)</script>", detail="Disk full")
+        operation_log.record("another-user", "copy", "failed", item="private.txt")
+        page = self.client.get("/operations").get_data(as_text=True)
+        self.assertIn("&lt;script&gt;", page)
+        self.assertNotIn("<script>alert(1)</script>", page)
+        self.assertNotIn("private.txt", page)
 
 
 if __name__ == "__main__":
