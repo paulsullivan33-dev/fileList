@@ -300,7 +300,8 @@ def _probe_stream_codecs(source):
 def _conversion_arg_sets(source):
     """Ordered ffmpeg argument sets to try for converting source to MP4.
 
-    AVI/MPG sources keep the historical single full transcode.  MKV sources
+    AVI/MPG/WMV sources keep the historical single full transcode (WMV's
+    VC-1/WMA streams are never copied into the MP4).  MKV sources
     are probed: an H.264 video stream is copied rather than re-encoded --
     with the audio copied too when it is already AAC, otherwise transcoded
     to AAC -- and a full transcode is the fallback when the copy attempt is

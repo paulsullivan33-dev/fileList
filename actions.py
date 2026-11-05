@@ -662,8 +662,8 @@ def register(app, DIRECTORIES):
             return {"success": False, "error": "Invalid name or path."}, 400
 
         extension = os.path.splitext(name)[1].lower()
-        if extension not in {".avi", ".mpg", ".mpeg", ".mkv"}:
-            return {"success": False, "error": "Only AVI, MPG and MKV files can be converted."}, 400
+        if extension not in {".avi", ".mpg", ".mpeg", ".mkv", ".wmv"}:
+            return {"success": False, "error": "Only AVI, MPG, MKV and WMV files can be converted."}, 400
 
         root_dir, _ = DIRECTORIES[dir_index]
         source = safe_join(root_dir, path, name)

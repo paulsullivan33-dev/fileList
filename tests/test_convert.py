@@ -2,7 +2,8 @@
 
 These tests pin the smart conversion behaviour ported from the deployed
 Vostro worker: an H.264 MKV is remuxed rather than re-encoded, other MKVs
-take a mapped transcode, and AVI/MPG keep the historical single transcode.
+take a mapped transcode, and AVI/MPG/WMV keep the historical single
+transcode (WMV's VC-1/WMA streams are never copied into the MP4).
 """
 import json
 import os
@@ -34,6 +35,10 @@ class ConversionArgSetsTests(unittest.TestCase):
 
     def test_mpg_keeps_legacy_transcode(self):
         self.assertEqual(self.arg_sets("/data/movie.mpg"),
+                         [["-c:v", "libx264", "-c:a", "aac"]])
+
+    def test_wmv_keeps_legacy_transcode(self):
+        self.assertEqual(self.arg_sets("/data/movie.wmv"),
                          [["-c:v", "libx264", "-c:a", "aac"]])
 
     def test_mkv_h264_aac_remuxes_with_transcode_fallback(self):
@@ -124,6 +129,7 @@ class ConvertRouteGateTests(unittest.TestCase):
         ]), encoding="utf-8")
         (self.root / "clip.mkv").write_bytes(b"placeholder")
         (self.root / "clip.avi").write_bytes(b"placeholder")
+        (self.root / "clip.wmv").write_bytes(b"placeholder")
         (self.root / "notes.txt").write_text("nope", encoding="utf-8")
         self.directories = [Directory(str(self.root), "/files", "Files", "members")]
         self.app = Flask(__name__, root_path=str(self.root))
@@ -144,6 +150,13 @@ class ConvertRouteGateTests(unittest.TestCase):
                          "Conversion route is Linux-only")
     def test_mkv_is_accepted(self):
         response = self.post_convert("clip.mkv")
+        self.assertEqual(response.status_code, 202)
+        self.assertTrue(response.get_json()["success"])
+
+    @unittest.skipUnless(os.sys.platform.startswith("linux"),
+                         "Conversion route is Linux-only")
+    def test_wmv_is_accepted(self):
+        response = self.post_convert("clip.wmv")
         self.assertEqual(response.status_code, 202)
         self.assertTrue(response.get_json()["success"])
 
@@ -223,6 +236,15 @@ class WorkerConversionTests(unittest.TestCase):
         output = self.media / "old.mp4"
         self.assertTrue(output.exists())
         self.assert_mp4_codecs(output, "h264", "aac")
+
+    def test_wmv_converts_and_completes(self):
+        self.generate("clip.wmv", "wmv2", "wmav2")
+        self.run_conversion("clip.wmv")
+        output = self.media / "clip.mp4"
+        self.assertTrue(output.exists())
+        self.assert_mp4_codecs(output, "h264", "aac")
+        self.assertTrue((self.media / "clip.wmv").exists())
+        self.assertEqual(list(self.media.glob("*.partial.mp4")), [])
 
 
 if __name__ == "__main__":

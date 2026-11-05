@@ -209,7 +209,7 @@ def register(app, DIRECTORIES):
                 )
 
             convert_link = ""
-            if sys.platform.startswith("linux") and not is_dir and ext in {".avi", ".mpg", ".mpeg", ".mkv"}:
+            if sys.platform.startswith("linux") and not is_dir and ext in {".avi", ".mpg", ".mpeg", ".mkv", ".wmv"}:
                 convert_link = (
                     f" / <a href='#' class='convert-link' "
                     f"data-name='{html.escape(display_name, quote=True)}' "
