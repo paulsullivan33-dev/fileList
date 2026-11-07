@@ -329,7 +329,10 @@ keeping completed items. Terminal results stay visible until you choose to refre
 the file list; the live panel remembers the ten most recent terminal job IDs and
 fetches their details with the normal account checks.
 
-Copy, move, and remote-copy jobs record each fully completed item. Retrying creates
+Copy, move, remote-copy, and remote-move jobs record each fully completed item.
+A remote move removes each local original only after that item has been published
+at its final name on the remote host, so a failed or cancelled move leaves every
+unfinished source in place. Retrying creates
 a new job containing only the unfinished items, so completed files do not block
 the remaining selection. Progress on the new job covers that remaining selection.
 Retries recheck current directory and remote-destination permissions; local workers

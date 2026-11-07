@@ -260,7 +260,7 @@ def item_summary(job):
 def retry_selection(job):
     """Keep completed items out of a retry without trusting destination existence."""
     source, destination = dict(job["source"]), dict(job["destination"])
-    if job["operation"] in {"copy", "move", "remote_copy", "convert"}:
+    if job["operation"] in {"copy", "move", "remote_copy", "remote_move", "convert"}:
         completed = set(job.get("completed_names", []))
         remaining = [name for name in source.get("names", []) if name not in completed]
         if not remaining:

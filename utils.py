@@ -202,7 +202,7 @@ def bind_job_selection(selection, directories):
 def authorize_job(job, directories, groups):
     """Resolve immutable folder references before checking current grants."""
     operation = job.get("operation")
-    if operation not in {"copy", "move", "convert", "remote_copy"}:
+    if operation not in {"copy", "move", "convert", "remote_copy", "remote_move"}:
         raise ValueError("Unknown job operation.")
     selections = [job["source"]]
     if operation in {"copy", "move"}:
@@ -211,6 +211,6 @@ def authorize_job(job, directories, groups):
         index = resolve_job_directory(selection, directories)
         if not user_can_access_directory(directories[index], groups):
             raise PermissionError("You cannot access a directory required by this job.")
-    if operation == "remote_copy":
+    if operation in {"remote_copy", "remote_move"}:
         import remote_copy
         remote_copy.destination_for(job["destination"].get("remote_id"), groups)

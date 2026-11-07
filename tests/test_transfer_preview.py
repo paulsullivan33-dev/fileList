@@ -194,6 +194,23 @@ class TransferPreviewTests(unittest.TestCase):
         self.assertEqual(job["destination"]["configuration"]["path"], "/srv/backup/incoming")
         self.assertEqual((self.source / "report..txt").read_bytes(), b"12345")
 
+    def test_remote_move_queues_the_previewed_subfolder(self):
+        destination = dict(id="backup", name="Backup", host="backup", path="/srv/backup", group="members")
+        with patch.object(remote_copy, "load_destinations", return_value=[destination]), \
+                patch.object(remote_copy, "preview_destination", return_value=set()):
+            data = self.preview(operation="move", remote_id="backup", remote_subpath="incoming").get_json()
+            self.assertEqual(data["operation"], "move")
+            self.assertTrue(data["can_transfer"])
+            response = self.client.post("/remote_move", data={"src_dir": 0, "src_path": "", "name": "report..txt",
+                                        "remote_id": "backup", "remote_subpath": "incoming",
+                                        "preview_signature": data["preview_signature"]})
+        self.assertEqual(response.status_code, 200)
+        job = job_store.history("tester")[0]
+        self.assertEqual(job["operation"], "remote_move")
+        self.assertEqual(job["destination"]["configuration"]["path"], "/srv/backup/incoming")
+        # Queueing a move removes nothing; only a completed job may.
+        self.assertEqual((self.source / "report..txt").read_bytes(), b"12345")
+
     @unittest.skipUnless(os.name == "posix", "Remote shell command check requires POSIX")
     def test_remote_conflict_command_handles_spaces_and_quotes(self):
         name = "report 'quoted'..txt"

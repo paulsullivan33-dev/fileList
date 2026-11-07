@@ -61,6 +61,16 @@ class RemoteCopyTests(unittest.TestCase):
         job, path = job_store.claim_next()
         return job, path
 
+    def submit_move(self, **updates):
+        data = dict(src_dir="0", src_path="", name="a file.txt", remote_id="backup")
+        data.update(updates)
+        return self.client.post("/remote_move", data=data)
+
+    def move_job(self):
+        self.assertEqual(self.submit_move().status_code, 200)
+        job, path = job_store.claim_next()
+        return job, path
+
     def run_job(self, job, path, process):
         users = json.dumps([dict(username="tester", groups="allowed")])
         with patch.object(Path, "open", return_value=io.StringIO(users)), \
@@ -216,6 +226,99 @@ class RemoteCopyTests(unittest.TestCase):
         self.assertEqual(record["bytes_completed"], len("content"))
         self.assertIsNone(record["remote_partial_path"])
         self.assertTrue((self.source / "a file.txt").exists())
+
+    def test_all_pickers_show_remote_move_button(self):
+        for route, selection in (("/copy", {"src_name": "a file.txt"}),
+                                 ("/move", {"src_name": "folder"}),
+                                 ("/bulk_move", {"name": ["a file.txt", "folder"]})):
+            with self.subTest(route=route):
+                page = self.client.get(route, query_string=dict(src_dir="0", src_path="", **selection)).get_data(as_text=True)
+                self.assertIn("action='/remote_move'", page)
+                self.assertIn("Move here and remove the local original.", page)
+                self.assertIn(">Move here</button>", page)
+
+    def test_queues_remote_move_without_modifying_sources(self):
+        response = self.submit_move(name=["a file.txt", "folder"])
+        self.assertEqual(response.status_code, 200)
+        job, _ = job_store.claim_next()
+        self.assertEqual(job["operation"], "remote_move")
+        self.assertEqual(job["source"]["names"], ["a file.txt", "folder"])
+        self.assertTrue((self.source / "a file.txt").exists())
+        self.assertTrue((self.source / "folder").exists())
+
+    def test_remote_move_removes_file_and_folder_sources_after_publish(self):
+        self.assertEqual(self.submit_move(name=["a file.txt", "folder"]).status_code, 200)
+        job, path = job_store.claim_next()
+        commands = []
+        self.run_job(job, path, lambda command, check: commands.append(command))
+        publishes = [c for c in commands if c[0] == "ssh" and "mv -T -n --" in c[-1]]
+        self.assertEqual(len(publishes), 2)
+        self.assertFalse((self.source / "a file.txt").exists())
+        self.assertFalse((self.source / "folder").exists())
+        self.assertEqual(job_store.read_path(path)["completed_names"], ["a file.txt", "folder"])
+
+    def test_remote_move_keeps_source_when_rsync_fails(self):
+        job, path = self.move_job()
+        def process(command, check):
+            if command[0] == "rsync":
+                raise RuntimeError("connection failed")
+        with self.assertRaisesRegex(RuntimeError, "connection failed"):
+            self.run_job(job, path, process)
+        self.assertTrue((self.source / "a file.txt").exists())
+
+    def test_remote_move_keeps_source_when_publish_fails(self):
+        job, path = self.move_job()
+        def process(command, check):
+            if command[0] == "ssh" and "mv -T -n --" in command[-1]:
+                raise RuntimeError("Destination already exists; staged copy retained")
+        with self.assertRaisesRegex(RuntimeError, "staged copy retained"):
+            self.run_job(job, path, process)
+        self.assertTrue((self.source / "a file.txt").exists())
+
+    def test_remote_move_cancellation_keeps_source(self):
+        job, path = self.move_job()
+        job_store.request_cancel(job["job_id"], "tester")
+        process = Mock()
+        with self.assertRaises(job_worker.JobCancelled):
+            self.run_job(job, path, process)
+        process.assert_not_called()
+        self.assertTrue((self.source / "a file.txt").exists())
+
+    def test_partial_remote_move_retry_keeps_only_unfinished_items(self):
+        self.assertEqual(self.submit_move(name=["a file.txt", "folder"]).status_code, 200)
+        job, path = job_store.claim_next()
+        transfers = []
+        def process(command, check):
+            if command[0] == "rsync":
+                transfers.append(command[-2])
+                if len(transfers) == 2:
+                    raise RuntimeError("Second transfer failed")
+        with self.assertRaisesRegex(RuntimeError, "Second transfer"):
+            self.run_job(job, path, process)
+        # The finished item was published and its source removed; the failed
+        # item's source is untouched, and a retry must not ask for it again.
+        self.assertFalse((self.source / "a file.txt").exists())
+        self.assertTrue((self.source / "folder").exists())
+        failed = job_store.finish(path, "failed", "Second transfer failed")
+        self.assertEqual(failed["completed_names"], ["a file.txt"])
+        source, destination = job_store.retry_selection(failed)
+        self.assertEqual(source["names"], ["folder"])
+        retry = job_store.create("remote_move", "tester", source, destination)
+        retry, path = job_store.claim_next()
+        commands = []
+        self.run_job(retry, path, lambda command, check: commands.append(command))
+        copies = [command for command in commands if command[0] == "rsync"]
+        self.assertEqual(len(copies), 1)
+        self.assertEqual(copies[0][-2], str(self.source / "folder"))
+        self.assertFalse((self.source / "folder").exists())
+
+    def test_worker_dispatches_remote_move_job(self):
+        self.assertEqual(self.submit_move().status_code, 200)
+        with patch.object(job_worker.config_loader, "load_directories", return_value=self.directories), \
+                patch.object(remote_copy, "run_job") as run:
+            self.assertTrue(job_worker.run_once())
+        run.assert_called_once()
+        self.assertEqual(run.call_args[0][0]["operation"], "remote_move")
 
     def test_remote_copy_accepts_double_period_filename(self):
         name = "release..txt"

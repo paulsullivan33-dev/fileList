@@ -411,7 +411,7 @@ def run_once():
             authorize_job(job, directories, current_user_groups(job["owner"]))
         if job["operation"] in {"copy", "move"}:
             _run_transfer(job, path, directories)
-        elif job["operation"] == "remote_copy":
+        elif job["operation"] in {"remote_copy", "remote_move"}:
             import remote_copy
             remote_copy.run_job(job, path, directories, Progress, _check_cancel)
         elif job["operation"] == "convert":

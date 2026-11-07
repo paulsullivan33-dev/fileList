@@ -195,8 +195,7 @@ def register(app, DIRECTORIES):
                 + "".join(f"<th>{label}</th>" for label in ("When", "User", "Operation", "Outcome", "Item", "Source", "Destination", "Details", "Job ID"))
                 + "</tr></thead><tbody>" + rows + "</tbody></table>" + navigation)
 
-    @app.route("/remote_copy", methods=["POST"])
-    def remote_copy_items():
+    def queue_remote(operation):
         src_path = request.form.get("src_path", "")
         names = request.form.getlist("name")
         try:
@@ -209,7 +208,7 @@ def register(app, DIRECTORIES):
             )
             destination = remote_copy.with_subpath(destination, request.form.get("remote_subpath", ""))
             job = enqueue_job(
-                "remote_copy",
+                operation,
                 {"directory_index": src_index, "path": src_path, "names": names},
                 {"remote_id": destination["id"], "configuration": destination, "names": names},
             )
@@ -218,6 +217,14 @@ def register(app, DIRECTORIES):
         except (OSError, ValueError, RuntimeError) as error:
             return jsonify(success=False, error=str(error)), 400
         return _queued_job_response(job, src_index, src_path)
+
+    @app.route("/remote_copy", methods=["POST"])
+    def remote_copy_items():
+        return queue_remote("remote_copy")
+
+    @app.route("/remote_move", methods=["POST"])
+    def remote_move_items():
+        return queue_remote("remote_move")
 
     @app.route("/remote_directories")
     def remote_directories():

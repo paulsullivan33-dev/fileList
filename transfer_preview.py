@@ -51,7 +51,6 @@ def plan(operation, source_index, source_path, names, directories, groups,
         conflicts = remote_copy.preview_destination(selected, names)
         destination = {"remote_id": selected["id"], "configuration": selected, "names": names}
         folder = f"{selected['host']}:{selected['path']}"
-        operation = "copy"
     else:
         target_index = safe_dir_index(destination_index, directories, default=-1)
         if target_index is None or not user_can_access_directory(directories[target_index], groups):
@@ -90,7 +89,7 @@ def plan(operation, source_index, source_path, names, directories, groups,
             "total_bytes": totals["bytes"], "total_size": format_size(totals["bytes"]),
             "file_count": totals["files"], "folder_count": totals["folders"], "link_count": totals["links"],
             "items": items, "can_transfer": not any(item["conflict"] for item in items),
-            "preview_signature": signature("remote_copy" if is_remote else operation, source, destination)}
+            "preview_signature": signature(f"remote_{operation}" if is_remote else operation, source, destination)}
 
 
 def scripts():

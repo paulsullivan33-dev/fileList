@@ -4,6 +4,7 @@ import os
 import posixpath
 import re
 import shlex
+import shutil
 import subprocess
 import tempfile
 import time
@@ -166,16 +167,21 @@ def selector_html(index, path, names, local_tabs=""):
             host += f":{destination['port']}"
         fields = [("csrf_token", generate_csrf()), ("src_dir", index), ("src_path", path),
                   ("remote_id", destination["id"])] + [("name", name) for name in names]
+        hidden = "".join(f"<input type='hidden' name='{key}' value='{escape(value)}'>" for key, value in fields)
+        hidden += "<input type='hidden' name='remote_subpath' value=''>"
         panels.append(
             f"<div id='{escape(panel_id)}' class='remote-destination-panel' hidden>"
-            "<form method='post' action='/remote_copy' data-preview-operation='copy'>"
             f"<p><strong>{escape(destination['name'])}</strong> · {escape(host)}</p>"
             f"<p class='destination-path'>{escape(destination['path'])}</p>"
             f"<div class='remote-browser' data-remote-id='{escape(destination['id'])}'><button type='button' onclick='browseRemote(this, \"\")'>Browse remote folders</button><span class='remote-path'></span><ul></ul></div>"
+            "<form method='post' action='/remote_copy' data-preview-operation='copy'>"
             "<p>Copy here and keep the local original.</p>"
-            + "".join(f"<input type='hidden' name='{key}' value='{escape(value)}'>" for key, value in fields)
-            + "<input type='hidden' name='remote_subpath' value=''>"
-            + "<button class='move-here-btn' type='submit' disabled>Copy here</button></form></div>"
+            + hidden
+            + "<button class='move-here-btn' type='submit' disabled>Copy here</button></form>"
+            "<form method='post' action='/remote_move' data-preview-operation='move'>"
+            "<p>Move here and remove the local original.</p>"
+            + hidden
+            + "<button class='move-here-btn' type='submit' disabled>Move here</button></form></div>"
         )
     return (
         "<nav class='destination-tabs' aria-label='Local destinations and Remote servers'>"
@@ -190,24 +196,23 @@ function selectRemoteDestination(button) {
         tab.setAttribute('aria-expanded', tab === button ? 'true' : 'false');
     });
     document.getElementById('local-destination-panel').hidden = true;
-    const form = document.getElementById(button.getAttribute('aria-controls')).querySelector('form');
-    refreshTransferPreview(form);
+    document.getElementById(button.getAttribute('aria-controls')).querySelectorAll('form').forEach(refreshTransferPreview);
 }
 async function browseRemote(button, path) {
     const box = button.closest('.remote-browser');
-    const form = box.closest('form');
-    invalidateTransferPreview(form);
+    const forms = box.closest('.remote-destination-panel').querySelectorAll('form');
+    forms.forEach(invalidateTransferPreview);
     try {
     const response = await fetch('/remote_directories?remote_id=' + encodeURIComponent(box.dataset.remoteId) + '&path=' + encodeURIComponent(path));
     const data = await response.json().catch(() => ({}));
     if (!response.ok || !data.success) throw new Error(data.error || 'Could not list remote folders');
-    form.querySelector('[name=remote_subpath]').value = data.path;
+    forms.forEach(form => { form.querySelector('[name=remote_subpath]').value = data.path; });
     box.querySelector('.remote-path').textContent = data.path ? ' / ' + data.path : ' /';
     const list = box.querySelector('ul'); list.replaceChildren();
     if (data.path) { const up = document.createElement('button'); up.type = 'button'; up.textContent = '↑ Up'; up.onclick = () => browseRemote(up, data.path.split('/').slice(0, -1).join('/')); list.appendChild(up); }
     for (const name of data.directories) { const item = document.createElement('button'); item.type = 'button'; item.textContent = '📁 ' + name; item.onclick = () => browseRemote(item, data.path ? data.path + '/' + name : name); list.appendChild(item); }
-    refreshTransferPreview(form);
-    } catch (error) { form.querySelector('.transfer-preview').textContent = error.message || 'Could not list remote folders. Check again.'; }
+    forms.forEach(refreshTransferPreview);
+    } catch (error) { forms.forEach(form => { const preview = form.querySelector('.transfer-preview'); if (preview) preview.textContent = error.message || 'Could not list remote folders. Check again.'; }); }
 }
 </script>"""
         + transfer_preview.scripts()
@@ -316,6 +321,18 @@ def run_rsync(command, check_cancel, report_progress):
             pass
 
 
+def _remove_source(path):
+    """Remove a local source after its remote move has published.
+
+    Mirrors the local move's removal: real directories go recursively,
+    files and symlinks are unlinked.
+    """
+    if os.path.isdir(path) and not os.path.islink(path):
+        shutil.rmtree(path)
+    else:
+        os.remove(path)
+
+
 def run_job(job, job_path, directories, progress_class, check_cancel):
     import job_store
     # Re-read authorization at execution time; queued jobs do not carry privileges.
@@ -323,6 +340,7 @@ def run_job(job, job_path, directories, progress_class, check_cancel):
         users = json.load(source)
     user = next((u for u in users if u.get("username") == job["owner"]), None)
     groups = [g.strip() for g in user.get("groups", "").split(",") if g.strip()] if user else []
+    move = job.get("operation") == "remote_move"
     info = job["source"]
     _, sources = validate_sources(resolve_job_directory(info, directories), info.get("path", ""), info.get("names"), directories, groups, job_path)
     job_store.update(job_path, current_name=None)
@@ -386,6 +404,17 @@ def run_job(job, job_path, directories, progress_class, check_cancel):
                 f"rmdir -- {quote(stage)}"
             )
             run_process(ssh + [destination["host"], publish], check)
+            if move:
+                # The item is live at its final remote name; only now may the
+                # local original go. A removal failure is reported with both
+                # copies named, exactly like the local move.
+                try:
+                    _remove_source(source)
+                except OSError as error:
+                    raise OSError(
+                        "Destination completed, but source removal failed; both copies remain: "
+                        f"{error}"
+                    ) from error
             job_store.complete_item(job_path, name)
             job_store.update(job_path, remote_partial_path=None)
             progress.add(item_total - item_completed, force=True)
