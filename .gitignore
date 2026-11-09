@@ -38,6 +38,7 @@
 !/tests/test_safety.py
 !/tests/test_config_check.py
 !/tests/test_convert.py
+!/tests/test_create_text.py
 !/tests/test_archives.py
 !/tests/test_job_identity.py
 !/tests/test_transfers.py

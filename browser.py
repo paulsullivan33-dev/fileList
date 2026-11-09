@@ -392,6 +392,7 @@ def register(app, DIRECTORIES):
 
             <div class='toolbar'>
                 <button class='toolbar-btn primary' onclick='newFolder()'>📁 New Folder</button>
+                <button class='toolbar-btn' onclick='newTextFile()'>📄 New Text File</button>
                 <button class='toolbar-btn' onclick='createArchiveDialog()'>🗜️ Archive</button>
                 <button class='toolbar-btn danger' onclick='bulkDelete()'>🗑️ Delete Selected</button>
                 <button class='toolbar-btn' onclick='bulkMove()'>📦 Move Selected</button>
@@ -403,6 +404,22 @@ def register(app, DIRECTORIES):
                            placeholder='Search this folder...' aria-label='Search all filenames in this folder'>
                     <button type='submit'>Search</button>
                 </form>
+            </div>
+
+            <div id='textFilePanel' style='display:none; margin:10px 0;'>
+                <div>
+                    <input id='tfName' type='text' size='36'
+                           placeholder='File name (e.g. notes.txt)' aria-label='New text file name'>
+                </div>
+                <div>
+                    <textarea id='tfContent' rows='10' style='width:100%;' placeholder='Text content...'
+                              aria-label='New text file content'></textarea>
+                </div>
+                <div>
+                    <button class='toolbar-btn primary' onclick='submitTextFile()'>Create file</button>
+                    <button class='toolbar-btn' onclick='cancelTextFile()'>Cancel</button>
+                    <span>Created in the current folder with exactly this name; an existing name is refused, never overwritten.</span>
+                </div>
             </div>
 
             <table class='table' id='fileTable'>
@@ -796,6 +813,35 @@ function newFolder() {
     fd.append('path', path);
     fd.append('name', name);
     csrfFetch('/mkdir', {method: 'POST', body: fd})
+        .then(r => r.json())
+        .then(d => {
+            if (d.success) location.reload();
+            else alert('Failed: ' + d.error);
+        });
+}
+
+function newTextFile() {
+    const panel = document.getElementById('textFilePanel');
+    panel.style.display = panel.style.display === 'none' ? 'block' : 'none';
+    if (panel.style.display === 'block') document.getElementById('tfName').focus();
+}
+
+function cancelTextFile() {
+    document.getElementById('textFilePanel').style.display = 'none';
+}
+
+function submitTextFile() {
+    const name = document.getElementById('tfName').value.trim();
+    if (!name) { alert('Enter a file name.'); return; }
+    const content = document.getElementById('tfContent').value;
+    const dir  = document.getElementById('currentDir').value;
+    const path = document.getElementById('currentPath').value;
+    const fd = new FormData();
+    fd.append('dir', dir);
+    fd.append('path', path);
+    fd.append('name', name);
+    fd.append('content', content);
+    csrfFetch('/create_text', {method: 'POST', body: fd})
         .then(r => r.json())
         .then(d => {
             if (d.success) location.reload();

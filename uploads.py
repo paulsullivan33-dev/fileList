@@ -39,6 +39,10 @@ ALLOWED_EXTENSIONS = {
 MAX_FILE_SIZE = configured_bytes("MAX_FILE_SIZE", 500 * 1024 * 1024)
 MAX_REQUEST_SIZE = configured_bytes("MAX_REQUEST_SIZE", 2 * 1024 * 1024 * 1024)
 
+# Typed or pasted text (the create-text-file route). Generous enough for
+# a large pasted NZB, small enough to stay a text file, not an upload.
+MAX_TEXT_SIZE = configured_bytes("MAX_TEXT_SIZE", 10 * 1024 * 1024)
+
 RESERVED_NAMES = {".", "..", ".htaccess", ".git", ".gitignore"}
 
 
@@ -116,6 +120,30 @@ def _save_stream(fs, target_dir, max_size):
     return {"name": os.path.basename(dest), "size": written}
 
 
+def _create_text_file(target_dir, name, data):
+    """Write data as a NEW file named name in target_dir.
+
+    The caller validates the name. Publication follows the same
+    contract as _save_stream: the content is written to a temp file in
+    the same directory, fsynced, then published with
+    _rename_without_replace, so an existing file, directory, or
+    symlink at that name is a collision (FileExistsError), never an
+    overwrite. Returns {"name": name, "size": len(data)}.
+    """
+    descriptor, temporary = tempfile.mkstemp(prefix=".filelist-create-", suffix=".partial", dir=target_dir)
+    try:
+        with os.fdopen(descriptor, "wb") as out:
+            out.write(data)
+            out.flush()
+            os.fsync(out.fileno())
+        dest = os.path.join(target_dir, name)
+        _rename_without_replace(temporary, dest)
+    finally:
+        if os.path.lexists(temporary):
+            os.remove(temporary)
+    return {"name": name, "size": len(data)}
+
+
 # -----------------------------------------------------------------
 # Routes
 # -----------------------------------------------------------------
@@ -170,6 +198,57 @@ def register(app, DIRECTORIES):
             "saved": saved,
             "errors": errors,
         })
+
+    @app.route("/create_text", methods=["POST"], endpoint="create_text_file")
+    def create_text_file():
+        dir_index = safe_dir_index(request.form.get("dir"), DIRECTORIES)
+        if dir_index is None:
+            return jsonify({"success": False, "error": "Invalid directory."})
+
+        path = request.form.get("path", "") or ""
+        if not is_safe_path(path):
+            return jsonify({"success": False, "error": "Invalid path."})
+
+        root_dir, _ = DIRECTORIES[dir_index]
+        target_dir = safe_join(root_dir, path)
+        if target_dir is None or not os.path.isdir(target_dir):
+            return jsonify({"success": False,
+                            "error": "Destination is not a directory."})
+
+        # The name is used exactly as typed (unlike upload names, which
+        # are sanitized): anything that is not one safe segment is
+        # refused outright, so the file created is the file asked for.
+        name = request.form.get("name", "") or ""
+        if not is_safe_segment(name) or name in RESERVED_NAMES:
+            return jsonify({"success": False, "error": "Invalid filename."})
+        if not _allowed(name):
+            return jsonify({"success": False,
+                            "error": f"File type not allowed: {name}"})
+
+        data = (request.form.get("content", "") or "").encode("utf-8")
+        if len(data) > MAX_TEXT_SIZE:
+            return jsonify({"success": False,
+                            "error": f"Text too large (max {MAX_TEXT_SIZE} bytes)."})
+
+        destination = os.path.join(target_dir, name)
+        try:
+            ensure_free_space(target_dir, len(data))
+            result = _create_text_file(target_dir, name, data)
+        except FileExistsError:
+            operation_log.record(session.get("username"), "create_text", "failed",
+                                 destination=destination, item=name,
+                                 detail="File already exists")
+            return jsonify({"success": False,
+                            "error": "A file with that name already exists."})
+        except OSError as e:
+            operation_log.record(session.get("username"), "create_text", "failed",
+                                 destination=destination, item=name, detail=str(e))
+            return jsonify({"success": False, "error": str(e)})
+
+        operation_log.record(session.get("username"), "create_text", "complete",
+                             destination=destination, item=result["name"])
+        return jsonify({"success": True,
+                        "name": result["name"], "size": result["size"]})
 
 
 # -----------------------------------------------------------------

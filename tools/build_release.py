@@ -16,7 +16,7 @@ APPLICATION_FILES = (
     "tests/test_remote_copy.py", "tests/test_browser.py",
     "tests/test_safety.py", "tests/test_config_check.py", "tests/test_convert.py", "tests/test_archives.py",
     "tests/test_job_identity.py", "tests/test_transfers.py",
-    "tests/test_uploads.py", "tests/test_operation_log.py",
+    "tests/test_uploads.py", "tests/test_operation_log.py", "tests/test_create_text.py",
     "tests/test_transfer_preview.py", "tests/test_linux_integration.py", "tests/test_pagination.py",
     "tests/test_queue.py", "tests/test_worker_health.py", "tests/test_config_backups.py",
     "tools/check_config.py", "tools/config_backup.py",
