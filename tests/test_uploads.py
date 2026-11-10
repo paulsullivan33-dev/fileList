@@ -1,5 +1,7 @@
 """Concurrent uploads publish distinct complete files and clean up failures."""
 import io
+import os
+import stat
 import tempfile
 import threading
 import unittest
@@ -21,6 +23,13 @@ class UploadTests(unittest.TestCase):
     def save(self, content, name="file.txt", limit=1024):
         file = FileStorage(stream=io.BytesIO(content), filename=name)
         return uploads._save_stream(file, str(self.root), limit)
+
+    def test_uploaded_file_is_world_readable(self):
+        # Regression (Paul, 2026-11-09): same mkstemp 0600 leak as the
+        # create-text path — uploaded files published owner-only.
+        result = self.save(b"data")
+        mode = stat.S_IMODE(os.stat(self.root / result["name"]).st_mode)
+        self.assertEqual(mode, 0o644)
 
     def test_simultaneous_same_name_uploads_do_not_overwrite(self):
         (self.root / "file.txt").write_bytes(b"original")

@@ -77,6 +77,17 @@ def _unique_path(directory, filename):
     return candidate
 
 
+def _fix_publish_mode(fileno):
+    """mkstemp creates its file 0600 regardless of the service umask,
+    and the rename-without-replace publishes that mode unchanged —
+    so files this app created were readable only by the account the
+    service runs as, and Paul could not open them later from his Mac
+    (he browses the shares as a different user). Set the mode the
+    rest of the app publishes with (archive_ops uses 0644) on the
+    temp file before it is renamed into place."""
+    os.fchmod(fileno, 0o644)
+
+
 def _save_stream(fs, target_dir, max_size):
     """Stream a FileStorage to target_dir. Returns saved dict or raises."""
     name = _sanitize(fs.filename or "")
@@ -100,6 +111,7 @@ def _save_stream(fs, target_dir, max_size):
                 out.write(buf)
             out.flush()
             os.fsync(out.fileno())
+            _fix_publish_mode(out.fileno())
 
         base, extension = os.path.splitext(name)
         number = 0
@@ -136,6 +148,7 @@ def _create_text_file(target_dir, name, data):
             out.write(data)
             out.flush()
             os.fsync(out.fileno())
+            _fix_publish_mode(out.fileno())
         dest = os.path.join(target_dir, name)
         _rename_without_replace(temporary, dest)
     finally:

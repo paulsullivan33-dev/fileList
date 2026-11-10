@@ -1,6 +1,7 @@
 """Create-text-file tests: the helper's no-overwrite contract and the
 route's validation (name, path jail, extension allowlist, size cap)."""
 import os
+import stat
 import tempfile
 import unittest
 from pathlib import Path
@@ -23,6 +24,14 @@ class CreateTextHelperTests(unittest.TestCase):
         self.assertEqual(result, {"name": "notes.txt", "size": len(data.encode("utf-8"))})
         self.assertEqual((self.root / "notes.txt").read_bytes(), data.encode("utf-8"))
         self.assertFalse(list(self.root.glob("*.partial")))
+
+    def test_created_file_is_world_readable(self):
+        # Regression (Paul, 2026-11-09): the mkstemp 0600 mode survived
+        # publication, so a file created here could not be read later
+        # from another machine where Paul browses as a different user.
+        uploads._create_text_file(str(self.root), "notes.txt", b"hi")
+        mode = stat.S_IMODE(os.stat(self.root / "notes.txt").st_mode)
+        self.assertEqual(mode, 0o644)
 
     def test_existing_file_is_a_collision_and_untouched(self):
         (self.root / "notes.txt").write_bytes(b"original")
