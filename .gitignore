@@ -50,6 +50,7 @@
 !/tests/test_queue.py
 !/tests/test_worker_health.py
 !/tests/test_config_backups.py
+!/tests/test_run_scripts.py
 !/tools/
 /tools/*
 !/tools/install.py

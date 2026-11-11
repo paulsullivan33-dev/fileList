@@ -3,8 +3,6 @@ import html
 import json
 import shutil
 import sys
-import zipfile
-import tarfile
 import stat
 import urllib.parse
 import sqlite3
@@ -36,30 +34,9 @@ from utils import (
 )
 
 
-ARCHIVE_MAX_MEMBERS = 10000
-ARCHIVE_MAX_UNCOMPRESSED_BYTES = 10 * 1024 * 1024 * 1024
-
-
-def _archive_limits():
-    try:
-        members = max(1, int(os.environ.get("ARCHIVE_MAX_MEMBERS", ARCHIVE_MAX_MEMBERS)))
-    except ValueError:
-        members = ARCHIVE_MAX_MEMBERS
-    try:
-        size = max(0, int(os.environ.get("ARCHIVE_MAX_UNCOMPRESSED_BYTES", ARCHIVE_MAX_UNCOMPRESSED_BYTES)))
-    except ValueError:
-        size = ARCHIVE_MAX_UNCOMPRESSED_BYTES
-    return members, size
-
-
-def _validate_archive_size(entries):
-    max_members, max_size = _archive_limits()
-    if len(entries) > max_members:
-        raise ValueError(f"Archive has too many entries (maximum {max_members}).")
-    total = sum(size for size in entries if size > 0)
-    if total > max_size:
-        raise ValueError(f"Archive expands to {format_size(total)}, above the {format_size(max_size)} limit.")
-    return total
+# The limits live in archive_ops so the job worker enforces the same ones.
+_archive_limits = archive_ops.archive_limits
+_validate_archive_size = archive_ops.validate_archive_size
 
 
 def _allowed_directory_indices(directories):
@@ -74,7 +51,7 @@ def _enqueue_job(operation, source, destination, directories):
     owner = session.get("username")
     try:
         source = bind_job_selection(source, directories)
-        if operation in {"copy", "move", "convert"}:
+        if operation in {"copy", "move", "convert", "archive", "extract"}:
             destination = bind_job_selection(destination, directories)
         expected_preview = request.form.get("preview_signature")
         if expected_preview and expected_preview != transfer_preview.signature(operation, source, destination):
@@ -1049,22 +1026,35 @@ def register(app, DIRECTORIES):
         if cwd is None:
             return {"success": False, "error": "Path escapes root."}
 
+        if archive_type not in archive_ops.ARCHIVE_FORMATS:
+            return {"success": False, "error": f"Unsupported archive format: {archive_type}"}, 400
         archive_filename = f"{archive_name}.{archive_type}"
         archive_full = safe_join(root_dir, path, archive_filename)
         if archive_full is None:
             return {"success": False, "error": "Invalid archive name."}
+        if os.path.lexists(archive_full):
+            error = f"Destination already exists: {archive_filename}. Choose a new archive name."
+            log_operation("archive", "failed", cwd, archive_full, ", ".join(names), error)
+            return {"success": False, "error": error}, 409
+        missing = [n for n in names if not os.path.lexists(os.path.join(cwd, n))]
+        if missing:
+            return {"success": False, "error": f"Source does not exist: {missing[0]}"}, 404
 
+        # Archives can take minutes; build them in the job worker, with
+        # progress, cancel and retry, instead of inside this request.
         try:
-            archive_ops.create_archive(root_dir, cwd, names, archive_full, archive_type)
-        except FileExistsError as error:
-            log_operation("archive", "failed", cwd, archive_full, ", ".join(names), str(error))
-            return {"success": False, "error": str(error)}, 409
-        except (OSError, ValueError, RuntimeError, zipfile.BadZipFile, tarfile.TarError) as error:
-            log_operation("archive", "failed", cwd, archive_full, ", ".join(names), str(error))
-            return {"success": False, "error": str(error)}, 400
-
-        log_operation("archive", "complete", cwd, archive_full, ", ".join(names))
-        return {"success": True, "archive": archive_filename}
+            job = enqueue_job(
+                "archive",
+                {"directory_index": dir_index, "path": path, "names": names},
+                {"directory_index": dir_index, "path": path, "names": [archive_filename],
+                 "archive_type": archive_type},
+            )
+        except RuntimeError as error:
+            return {"success": False, "error": f"Could not queue archive: {error}"}, 409
+        except (OSError, ValueError) as error:
+            return {"success": False, "error": f"Could not queue archive: {error}"}, 400
+        return {"success": True, "archive": archive_filename, "job_id": job["job_id"],
+                "operation": job["operation"], "status": job["status"]}, 202
 
     # ---------------------------------------------------------
     # EXTRACT
@@ -1081,24 +1071,33 @@ def register(app, DIRECTORIES):
         if not is_safe_path(path) or not is_safe_segment(name):
             return warn_and_redirect(CSS_JS, "Invalid path.", dir_index, "")
 
+        archive_name = urllib.parse.unquote(name)
+        extract_name = os.path.splitext(archive_name)[0]
+        if not is_safe_segment(archive_name) or not is_safe_segment(extract_name):
+            return warn_and_redirect(CSS_JS, "Invalid path.", dir_index, path)
         root_dir, _ = DIRECTORIES[dir_index]
-        archive_full = safe_join(root_dir, path, urllib.parse.unquote(name))
+        archive_full = safe_join(root_dir, path, archive_name)
         if archive_full is None or not os.path.isfile(archive_full):
             return warn_and_redirect(CSS_JS, "Archive not found.", dir_index, path)
 
-        extract_dir = safe_join(
-            root_dir, path,
-            os.path.splitext(urllib.parse.unquote(name))[0]
-        )
+        extract_dir = safe_join(root_dir, path, extract_name)
         if extract_dir is None:
             return warn_and_redirect(CSS_JS, "Invalid extract target.",
                                      dir_index, path)
 
-        try:
-            archive_ops.extract_archive(archive_full, extract_dir, _validate_archive_size)
-        except (OSError, ValueError, RuntimeError, zipfile.BadZipFile, tarfile.TarError) as error:
-            log_operation("extract", "failed", archive_full, extract_dir, name, str(error))
+        if os.path.lexists(extract_dir):
+            error = (f"Destination already exists: {os.path.basename(extract_dir)}. "
+                     "Rename the existing folder before extracting.")
+            log_operation("extract", "failed", archive_full, extract_dir, name, error)
             return warn_and_redirect(CSS_JS, f"Extract failed: {error}", dir_index, path)
 
-        log_operation("extract", "complete", archive_full, extract_dir, name)
-        return _redirect_listing(dir_index, path)
+        # Extraction can take minutes; run it in the job worker.
+        try:
+            job = enqueue_job(
+                "extract",
+                {"directory_index": dir_index, "path": path, "names": [archive_name]},
+                {"directory_index": dir_index, "path": path, "names": [extract_name]},
+            )
+        except (OSError, RuntimeError, ValueError) as error:
+            return warn_and_redirect(CSS_JS, f"Could not queue extraction: {error}", dir_index, path)
+        return _queued_job_response(job, dir_index, path)

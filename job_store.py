@@ -247,7 +247,7 @@ def item_summary(job):
     remaining = [name for name in names if name not in completed and name not in failed and name != current]
     retry = [name for name in names if name not in completed]
     selections = [job.get("source", {})]
-    if job.get("operation") in {"copy", "move"}:
+    if job.get("operation") in {"copy", "move", "archive", "extract"}:
         selections.append(job.get("destination", {}))
     stable = all(selection.get("directory_id") and selection.get("directory_root") for selection in selections)
     return {"completed_names": completed, "failed_names": failed,
@@ -260,13 +260,15 @@ def item_summary(job):
 def retry_selection(job):
     """Keep completed items out of a retry without trusting destination existence."""
     source, destination = dict(job["source"]), dict(job["destination"])
-    if job["operation"] in {"copy", "move", "remote_copy", "remote_move", "convert"}:
+    if job["operation"] in {"copy", "move", "remote_copy", "remote_move", "convert", "archive", "extract"}:
         completed = set(job.get("completed_names", []))
         remaining = [name for name in source.get("names", []) if name not in completed]
         if not remaining:
             raise ValueError("All selected items already completed; there is nothing to retry.")
         source["names"] = remaining
-        if job["operation"] != "convert":
+        # A conversion, archive or extraction produces one named output, so
+        # its destination name is kept as it was.
+        if job["operation"] not in {"convert", "archive", "extract"}:
             destination["names"] = remaining
     return source, destination
 

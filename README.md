@@ -207,7 +207,7 @@ Flask File Manager is a self-hosted web application that provides a familiar fil
 - 📁 **Multi-directory support** — Configure multiple root directories and switch between them seamlessly
 - 👁️ **File previews** — Inline previews for images, text files, PDFs, and more
 - 🌙 **Dark mode** — Toggle between light and dark themes; preference is persisted
-- 🗜️ **Archive & extract** — Create `.zip` archives and extract them directly in the browser
+- 🗜️ **Archive & extract** — Create `.zip`, `.tar` and `.tgz` archives and extract them from the browser; both run as background jobs with progress, cancel and retry
 - ✏️ **Rename & move** — Rename files and move them across directories via a simple UI
 - 🔒 **Path validation** — Server-side enforcement prevents directory traversal and unauthorized access
 - 🎨 **Consistent styling** — Centralized styles for a cohesive, responsive layout
@@ -237,8 +237,12 @@ To leave fileList running after you close an SSH session, use:
 
 It starts `start` in the background and writes application and worker output to
 `run.log`. Follow that file with `tail -f run.log`. Shut down that background
-instance cleanly with `./stop.sh`; it signals `start`, which stops Flask and the
-worker, and waits up to ten seconds before forcing termination. For automatic restart after
+instance cleanly with `./stop.sh`. `run.sh` starts `start` in a process group of
+its own, so `./stop.sh` signals `start`, Flask and the worker together, waits up
+to ten seconds, then force-stops the whole group. An app or worker left behind by
+a crashed `start` is stopped too, and still counts as running for `./run.sh`.
+An instance started by an older `run.sh` is not in its own group; `./stop.sh`
+stops it the old way (launcher only), and the next `./run.sh` uses a group. For automatic restart after
 a crash or reboot, use the systemd service configuration described in
 [INSTALL.md](INSTALL.md).
 
@@ -375,7 +379,10 @@ and available space before writing files. Archive creation validates every
 source and rejects symbolic links, junctions, and special files. Creation and
 extraction use temporary staging and never overwrite an existing destination.
 Choose a new archive name or rename the existing extraction folder to proceed.
-Failed operations clean up their staging data. Archives require Windows or Linux
+Creating and extracting archives run in the job worker, like copies and moves:
+they show byte progress in the jobs panel and can be cancelled or retried.
+Failed or cancelled operations clean up their staging data, and a worker
+restart removes staging left by an interrupted one. Archives require Windows or Linux
 with atomic no-replace rename support; unsupported systems fail safely.
 Uploads, video conversion, and remote
 copy staging also reserve free space. The byte settings above show the defaults;

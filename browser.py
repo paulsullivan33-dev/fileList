@@ -869,9 +869,17 @@ function createArchiveDialog() {
     })
     .then(r => r.json())
     .then(d => {
-        if (d.success) { flash('Created: ' + d.archive); setTimeout(() => location.reload(), 800); }
+        if (d.success) {
+            // The archive is built by the job worker; track it in the jobs panel.
+            const job = {job_id: d.job_id, operation: d.operation || 'archive', status: d.status};
+            rememberJob(job);
+            showJob(job);
+            pollJob(d.job_id);
+            flash('Archive queued: ' + d.archive);
+        }
         else alert("Error: " + d.error);
-    });
+    })
+    .catch(e => alert("Error: " + e));
 }
 
 // -----------------------------------------------------------------

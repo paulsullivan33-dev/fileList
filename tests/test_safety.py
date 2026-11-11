@@ -432,12 +432,19 @@ class SafetyTests(unittest.TestCase):
         })
         self.assertNotIn("<script>alert(1)</script>", response.get_data(as_text=True))
 
+    def run_worker(self):
+        with patch.object(job_worker.config_loader, "load_directories", return_value=self.directories), \
+                patch.object(job_worker, "current_user_groups", return_value=["members"]):
+            return job_worker.run_once()
+
     def test_archive_routes_report_conflicts_without_overwriting(self):
         self.sign_in()
         response = self.client.post("/archive", json={
             "dir": 0, "names": ["a file.txt"], "name": "backup", "type": "zip",
         })
+        self.assertEqual(response.status_code, 202)
         self.assertTrue(response.get_json()["success"])
+        self.assertTrue(self.run_worker())
         original = (self.files / "backup.zip").read_bytes()
         response = self.client.post("/archive", json={
             "dir": 0, "names": ["a file.txt"], "name": "backup", "type": "zip",
@@ -446,12 +453,95 @@ class SafetyTests(unittest.TestCase):
         self.assertIn("already exists", response.get_json()["error"])
         self.assertEqual((self.files / "backup.zip").read_bytes(), original)
         response = self.client.post("/extract", data={"dir": 0, "name": "backup.zip"})
-        self.assertEqual(response.status_code, 302)
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(self.run_worker())
         extracted = self.files / "backup" / "a file.txt"
         extracted.write_text("keep this version", encoding="utf-8")
         response = self.client.post("/extract", data={"dir": 0, "name": "backup.zip"})
         self.assertIn("already exists", response.get_data(as_text=True))
         self.assertEqual(extracted.read_text(), "keep this version")
+
+    def test_archive_and_extract_run_as_queued_jobs_with_progress(self):
+        self.sign_in()
+        (self.files / "folder").mkdir()
+        (self.files / "folder" / "inner.txt").write_text("inner contents", encoding="utf-8")
+        response = self.client.post("/archive", json={
+            "dir": 0, "names": ["a file.txt", "folder"], "name": "bundle", "type": "tgz",
+        })
+        data = response.get_json()
+        self.assertEqual(data["operation"], "archive")
+        self.assertEqual(data["status"], "pending")
+        # Nothing is built inside the request.
+        self.assertFalse((self.files / "bundle.tgz").exists())
+        self.assertTrue(self.run_worker())
+        job, _ = job_store.find(data["job_id"])
+        self.assertEqual(job["status"], "complete")
+        self.assertEqual(job["bytes_total"], len("content") + len("inner contents"))
+        self.assertEqual(job["bytes_completed"], job["bytes_total"])
+        self.assertEqual(sorted(job["completed_names"]), ["a file.txt", "folder"])
+        self.assertTrue((self.files / "bundle.tgz").is_file())
+
+        response = self.client.post("/extract", data={"dir": 0, "name": "bundle.tgz"})
+        self.assertIn("activeFileJobs", response.get_data(as_text=True))
+        self.assertFalse((self.files / "bundle").exists())
+        self.assertTrue(self.run_worker())
+        self.assertEqual((self.files / "bundle" / "folder" / "inner.txt").read_text(), "inner contents")
+        records = operation_log.search("tester", operation="extract", outcome="complete")
+        self.assertTrue(records)
+        self.assertFalse(list(self.files.glob(".filelist-*")))
+
+    def test_cancelled_archive_job_leaves_no_output_or_staging(self):
+        self.sign_in()
+        data = self.client.post("/archive", json={
+            "dir": 0, "names": ["a file.txt"], "name": "never", "type": "zip",
+        }).get_json()
+        job_store.initialize()
+        job_store.cancel_path(data["job_id"]).touch()
+        # A cancel request for a pending job is honoured once it is running.
+        self.assertTrue(self.run_worker())
+        self.assertEqual(job_store.find(data["job_id"])[0]["status"], "cancelled")
+        self.assertFalse((self.files / "never.zip").exists())
+        self.assertFalse(list(self.files.glob(".filelist-*")))
+
+    def test_interrupted_archive_staging_is_removed_on_worker_restart(self):
+        self.sign_in()
+        data = self.client.post("/archive", json={
+            "dir": 0, "names": ["a file.txt"], "name": "crashed", "type": "zip",
+        }).get_json()
+        job, path = job_store.claim_next()
+        staging = self.files / ".filelist-archive-abc123.partial"
+        staging.mkdir()
+        (staging / "archive").write_bytes(b"half written")
+        job_store.update(path, temporary_path=str(staging))
+        self.assertEqual(job_store.recover_interrupted(), 1)
+        self.assertFalse(staging.exists())
+        self.assertEqual(job_store.find(data["job_id"])[0]["status"], "failed")
+
+    def test_failed_archive_job_can_be_retried(self):
+        self.sign_in()
+        data = self.client.post("/archive", json={
+            "dir": 0, "names": ["a file.txt"], "name": "retry", "type": "zip",
+        }).get_json()
+        (self.files / "a file.txt").rename(self.files / "moved away.txt")
+        self.assertTrue(self.run_worker())
+        failed, _ = job_store.find(data["job_id"])
+        self.assertEqual(failed["status"], "failed")
+        (self.files / "moved away.txt").rename(self.files / "a file.txt")
+        response = self.client.post("/job_retry", data={"job_id": data["job_id"]},
+                                    headers={"Accept": "application/json"})
+        self.assertEqual(response.status_code, 202)
+        retry, _ = job_store.find(response.get_json()["job_id"])
+        self.assertEqual(retry["destination"]["names"], ["retry.zip"])
+        self.assertTrue(self.run_worker())
+        self.assertTrue((self.files / "retry.zip").is_file())
+
+    def test_archive_route_rejects_unknown_format_before_queueing(self):
+        self.sign_in()
+        response = self.client.post("/archive", json={
+            "dir": 0, "names": ["a file.txt"], "name": "odd", "type": "rar",
+        })
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(job_store.pending_count(), 0)
 
     def test_operation_log_search_shows_upload_rename_and_delete_paths(self):
         self.sign_in()

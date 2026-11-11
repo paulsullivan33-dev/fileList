@@ -398,6 +398,78 @@ def _run_conversion(job, path, directories):
             os.remove(temporary)
 
 
+class _ArchiveReporter:
+    """Bridge archive_ops' progress hooks to the job record: byte progress,
+    cancellation checks (Progress.add calls _check_cancel), and the staging
+    path that crash recovery removes."""
+
+    def __init__(self, job, path):
+        self.job = job
+        self.path = path
+        self.progress = None
+
+    def begin(self, total):
+        _check_cancel(self.job["job_id"])
+        self.progress = Progress(self.job, self.path, total)
+
+    def add(self, amount):
+        if self.progress is not None:
+            self.progress.add(amount)
+
+    def staging(self, staging_path):
+        job_store.update(self.path, temporary_path=staging_path)
+
+
+def _run_archive_job(job, path, directories):
+    """Create an archive, or extract one, as a queued job.
+
+    The web route has already checked the request; this re-checks it against
+    the current configuration, because the folder may have changed while the
+    job waited in the queue.
+    """
+    import archive_ops
+
+    source_info, destination_info = job["source"], job["destination"]
+    source_index = resolve_job_directory(source_info, directories)
+    destination_index = resolve_job_directory(destination_info, directories)
+    relative_path = source_info.get("path", "")
+    names = source_info.get("names") or []
+    outputs = destination_info.get("names") or []
+    if (
+        source_index != destination_index
+        or destination_info.get("path", "") != relative_path
+        or not is_safe_path(relative_path)
+        or not names
+        or not all(is_safe_segment(name) for name in names)
+        or len(outputs) != 1
+        or not is_safe_segment(outputs[0])
+    ):
+        raise ValueError("Invalid queued archive paths.")
+    root, _ = directories[source_index]
+    folder = safe_join(root, relative_path)
+    target = safe_join(root, relative_path, outputs[0])
+    if folder is None or target is None or not os.path.isdir(folder):
+        raise ValueError("The folder for this job no longer exists.")
+    reporter = _ArchiveReporter(job, path)
+    job_store.start_item(path, names[0])
+    if job["operation"] == "archive":
+        archive_ops.create_archive(root, folder, names, target,
+                                   destination_info.get("archive_type"), reporter=reporter)
+    else:
+        if len(names) != 1:
+            raise ValueError("Invalid queued extraction.")
+        archive = safe_join(root, relative_path, names[0])
+        if archive is None or not os.path.isfile(archive):
+            raise ValueError(f"Archive no longer exists: {names[0]}")
+        archive_ops.extract_archive(archive, target, archive_ops.validate_archive_size,
+                                    reporter=reporter)
+    job_store.update(path, temporary_path=None)
+    for name in names:
+        job_store.complete_item(path, name)
+    if reporter.progress is not None:
+        reporter.progress.add(0, force=True)
+
+
 def run_once():
     worker_health.checkpoint(state="checking_queue", phase="Checking the queue", job_id=None)
     job, path = job_store.claim_next()
@@ -407,10 +479,12 @@ def run_once():
     worker_health.checkpoint(state="busy", phase="Processing transfer", job_id=job["job_id"])
     try:
         directories = config_loader.load_directories()
-        if job["operation"] in {"copy", "move", "convert"}:
+        if job["operation"] in {"copy", "move", "convert", "archive", "extract"}:
             authorize_job(job, directories, current_user_groups(job["owner"]))
         if job["operation"] in {"copy", "move"}:
             _run_transfer(job, path, directories)
+        elif job["operation"] in {"archive", "extract"}:
+            _run_archive_job(job, path, directories)
         elif job["operation"] in {"remote_copy", "remote_move"}:
             import remote_copy
             remote_copy.run_job(job, path, directories, Progress, _check_cancel)

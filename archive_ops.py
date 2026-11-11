@@ -7,7 +7,70 @@ import tempfile
 import zipfile
 
 from job_worker import _rename_without_replace
-from utils import ensure_free_space, is_safe_segment, safe_join
+from utils import ensure_free_space, format_size, is_safe_segment, safe_join
+
+
+ARCHIVE_MAX_MEMBERS = 10000
+ARCHIVE_MAX_UNCOMPRESSED_BYTES = 10 * 1024 * 1024 * 1024
+COPY_CHUNK = 4 * 1024 * 1024
+ARCHIVE_FORMATS = {"zip", "tar", "tgz"}
+
+
+def archive_limits():
+    try:
+        members = max(1, int(os.environ.get("ARCHIVE_MAX_MEMBERS", ARCHIVE_MAX_MEMBERS)))
+    except ValueError:
+        members = ARCHIVE_MAX_MEMBERS
+    try:
+        size = max(0, int(os.environ.get("ARCHIVE_MAX_UNCOMPRESSED_BYTES", ARCHIVE_MAX_UNCOMPRESSED_BYTES)))
+    except ValueError:
+        size = ARCHIVE_MAX_UNCOMPRESSED_BYTES
+    return members, size
+
+
+def validate_archive_size(entries):
+    max_members, max_size = archive_limits()
+    if len(entries) > max_members:
+        raise ValueError(f"Archive has too many entries (maximum {max_members}).")
+    total = sum(size for size in entries if size > 0)
+    if total > max_size:
+        raise ValueError(f"Archive expands to {format_size(total)}, above the {format_size(max_size)} limit.")
+    return total
+
+
+class _NullReporter:
+    """Progress hooks for queued archive jobs; a direct call needs none."""
+    def begin(self, total):
+        pass
+
+    def add(self, amount):
+        pass
+
+    def staging(self, path):
+        pass
+
+
+class _CountingReader:
+    """Report bytes as they are read, so progress and cancellation reach
+    long single-file reads (tarfile.addfile reads its source itself)."""
+    def __init__(self, source, reporter):
+        self.source = source
+        self.reporter = reporter
+
+    def read(self, size=-1):
+        data = self.source.read(size)
+        if data:
+            self.reporter.add(len(data))
+        return data
+
+
+def _copy_stream(source, output, reporter):
+    while True:
+        chunk = source.read(COPY_CHUNK)
+        if not chunk:
+            break
+        output.write(chunk)
+        reporter.add(len(chunk))
 
 
 def _source_entries(root, cwd, names):
@@ -58,14 +121,20 @@ def _open_source(root, path, expected):
     return result
 
 
-def create_archive(root, cwd, names, target, kind):
-    if kind not in {"zip", "tar", "tgz"}:
+def create_archive(root, cwd, names, target, kind, reporter=None):
+    reporter = reporter or _NullReporter()
+    if kind not in ARCHIVE_FORMATS:
         raise ValueError(f"Unsupported archive format: {kind}")
     if os.path.lexists(target):
         raise FileExistsError(f"Destination already exists: {os.path.basename(target)}. Choose a new archive name.")
     entries = _source_entries(root, cwd, names)
-    ensure_free_space(cwd, sum(info.st_size for _, _, info in entries if stat.S_ISREG(info.st_mode)))
-    with tempfile.TemporaryDirectory(prefix=".filelist-archive-", dir=cwd) as staging:
+    total = sum(info.st_size for _, _, info in entries if stat.S_ISREG(info.st_mode))
+    ensure_free_space(cwd, total)
+    reporter.begin(total)
+    # The ".partial" suffix lets the worker's crash recovery remove a staging
+    # folder that a killed worker left behind.
+    with tempfile.TemporaryDirectory(prefix=".filelist-archive-", suffix=".partial", dir=cwd) as staging:
+        reporter.staging(staging)
         temporary = os.path.join(staging, "archive")
         if kind == "zip":
             with zipfile.ZipFile(temporary, "x", zipfile.ZIP_DEFLATED) as archive:
@@ -74,7 +143,7 @@ def create_archive(root, cwd, names, target, kind):
                         archive.writestr(relative + "/", b"")
                     else:
                         with _open_source(root, path, info) as source, archive.open(relative, "w", force_zip64=True) as output:
-                            shutil.copyfileobj(source, output)
+                            _copy_stream(source, output, reporter)
         else:
             with tarfile.open(temporary, "x:gz" if kind == "tgz" else "x") as archive:
                 for path, relative, info in entries:
@@ -87,7 +156,7 @@ def create_archive(root, cwd, names, target, kind):
                     else:
                         member.size = info.st_size
                         with _open_source(root, path, info) as source:
-                            archive.addfile(member, source)
+                            archive.addfile(member, _CountingReader(source, reporter))
         _rename_without_replace(temporary, target)
 
 
@@ -104,7 +173,7 @@ def _member_target(staging, name, is_directory):
     return target
 
 
-def _extract_member(staging, name, is_directory, source):
+def _extract_member(staging, name, is_directory, source, reporter=None):
     target = _member_target(staging, name, is_directory)
     if is_directory:
         os.makedirs(target, exist_ok=True)
@@ -112,7 +181,7 @@ def _extract_member(staging, name, is_directory, source):
         os.makedirs(os.path.dirname(target), exist_ok=True)
         # Also reject duplicate/normalized-colliding archive members.
         with open(target, "xb") as output:
-            shutil.copyfileobj(source, output)
+            _copy_stream(source, output, reporter or _NullReporter())
 
 
 def _flatten_duplicate_wrapper(staging, target):
@@ -150,18 +219,22 @@ def _normalize_permissions(staging):
             os.chmod(os.path.join(current, name), 0o644)
 
 
-def extract_archive(source, target, validate_size):
+def extract_archive(source, target, validate_size=None, reporter=None):
+    validate_size = validate_size or validate_archive_size
+    reporter = reporter or _NullReporter()
     if os.path.lexists(target):
         raise FileExistsError(f"Destination already exists: {os.path.basename(target)}. Rename the existing folder before extracting.")
     parent = os.path.dirname(target)
-    staging = tempfile.mkdtemp(prefix=".filelist-extract-", dir=parent)
+    staging = tempfile.mkdtemp(prefix=".filelist-extract-", suffix=".partial", dir=parent)
     try:
+        reporter.staging(staging)
         extension = os.path.splitext(source.lower())[1]
         if extension == ".zip":
             with zipfile.ZipFile(source) as archive:
                 members = archive.infolist()
                 total = validate_size([member.file_size for member in members])
                 ensure_free_space(parent, total)
+                reporter.begin(total)
                 for member in members:
                     if stat.S_ISLNK(member.external_attr >> 16):
                         raise ValueError(f"Archive links are not allowed: {member.filename}")
@@ -169,18 +242,19 @@ def extract_archive(source, target, validate_size):
                         _extract_member(staging, member.filename, True, None)
                     else:
                         with archive.open(member) as content:
-                            _extract_member(staging, member.filename, False, content)
+                            _extract_member(staging, member.filename, False, content, reporter)
         elif extension in {".tar", ".gz", ".tgz"}:
             with tarfile.open(source, "r:*") as archive:
                 members = archive.getmembers()
                 total = validate_size([member.size for member in members])
                 ensure_free_space(parent, total)
+                reporter.begin(total)
                 for member in members:
                     if member.isdir():
                         _extract_member(staging, member.name, True, None)
                     elif member.isfile():
                         with archive.extractfile(member) as content:
-                            _extract_member(staging, member.name, False, content)
+                            _extract_member(staging, member.name, False, content, reporter)
                     else:
                         raise ValueError(f"Unsafe archive entry type: {member.name}")
         else:
