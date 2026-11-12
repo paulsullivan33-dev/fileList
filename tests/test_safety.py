@@ -384,10 +384,10 @@ class SafetyTests(unittest.TestCase):
             {"directory_index": 0, "path": "", "names": names},
             {"directory_index": 1, "path": "", "names": names})
         original = job_worker._copy_staged
-        def fail_second(source, destination, progress):
+        def fail_second(source, destination, progress, *arguments):
             if os.path.basename(source) == names[1]:
                 raise OSError("Disk full")
-            return original(source, destination, progress)
+            return original(source, destination, progress, *arguments)
         with patch.object(job_worker.config_loader, "load_directories", return_value=self.directories), \
                 patch.object(job_worker, "current_user_groups", return_value=["members"]), \
                 patch.object(job_worker, "_copy_staged", side_effect=fail_second):

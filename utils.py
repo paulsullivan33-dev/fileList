@@ -3,6 +3,7 @@ import json
 import html
 import urllib.parse
 import shutil
+import time
 from contextlib import contextmanager
 
 IMAGE_EXT = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".svg"}
@@ -23,6 +24,34 @@ def minimum_free_bytes():
 
 def remote_minimum_free_bytes():
     return configured_bytes("FILELIST_REMOTE_MIN_FREE_BYTES", minimum_free_bytes())
+
+
+class FreeSpaceGuard:
+    """Re-check free space while writing, without a statvfs per chunk.
+
+    On network storage every free-space check is a round trip, and checking
+    each chunk (or each small file) adds up. The first write is always
+    checked; after that, at most once per INTERVAL_BYTES written or
+    INTERVAL_SECONDS elapsed. The unchecked gap (64 MiB) stays well inside
+    the default FILELIST_MIN_FREE_BYTES reserve (256 MiB).
+    """
+    INTERVAL_BYTES = 64 * 1024 * 1024
+    INTERVAL_SECONDS = 1.0
+
+    def __init__(self, directory, check=None):
+        self.directory = directory
+        self.check = check or ensure_free_space
+        self.unchecked = 0
+        self.last_check = None
+
+    def before_write(self, nbytes):
+        now = time.monotonic()
+        if (self.last_check is None or self.unchecked >= self.INTERVAL_BYTES
+                or now - self.last_check >= self.INTERVAL_SECONDS):
+            self.check(self.directory, nbytes)
+            self.unchecked = 0
+            self.last_check = now
+        self.unchecked += nbytes
 
 
 def ensure_free_space(directory, required_bytes, reserve_bytes=None):

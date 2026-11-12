@@ -9,7 +9,7 @@ import operation_log
 from werkzeug.utils import secure_filename
 from job_worker import _rename_without_replace
 
-from utils import configured_bytes, ensure_free_space, is_safe_path, is_safe_segment, safe_join, safe_dir_index
+from utils import FreeSpaceGuard, configured_bytes, ensure_free_space, is_safe_path, is_safe_segment, safe_join, safe_dir_index
 
 
 # -----------------------------------------------------------------
@@ -103,6 +103,7 @@ def _save_stream(fs, target_dir, max_size):
 
     descriptor, temporary = tempfile.mkstemp(prefix=".filelist-upload-", suffix=".partial", dir=target_dir)
     written = 0
+    space = FreeSpaceGuard(target_dir, check=ensure_free_space)
     try:
         with os.fdopen(descriptor, "wb") as out:
             while True:
@@ -112,7 +113,7 @@ def _save_stream(fs, target_dir, max_size):
                 written += len(buf)
                 if written > max_size:
                     raise ValueError(f"file too large (max {max_size} bytes)")
-                ensure_free_space(target_dir, len(buf))
+                space.before_write(len(buf))
                 out.write(buf)
             out.flush()
             os.fsync(out.fileno())

@@ -76,9 +76,11 @@ class LinuxIntegrationTests(unittest.TestCase):
         if slow:
             # Timing-only instrumentation makes interruption deterministic; I/O,
             # authorization, locking, and recovery still use production code.
+            # The delay hooks the per-chunk cancellation check (free-space
+            # checks are throttled, so they no longer run on every chunk).
             program = ("import time,job_worker; job_worker.CHUNK_SIZE=65536; "
-                       "original=job_worker.ensure_free_space; "
-                       "job_worker.ensure_free_space=lambda *a,**k:(time.sleep(0.002),original(*a,**k))[1]; "
+                       "original=job_worker._check_cancel; "
+                       "job_worker._check_cancel=lambda *a,**k:(time.sleep(0.002),original(*a,**k))[1]; "
                        "raise SystemExit(job_worker.main(['--once']))")
             arguments = [sys.executable, "-B", "-c", program]
         else:
