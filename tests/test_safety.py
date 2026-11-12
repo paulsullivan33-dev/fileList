@@ -535,6 +535,31 @@ class SafetyTests(unittest.TestCase):
         self.assertTrue(self.run_worker())
         self.assertTrue((self.files / "retry.zip").is_file())
 
+    def test_failed_archive_job_reports_every_item_failed_and_names_the_cause(self):
+        # The archive is built from all items and published only if all
+        # succeed, so a failure on the last item must not be blamed on the
+        # first, nor leave the others listed as not started.
+        self.sign_in()
+        (self.files / "b.txt").write_text("b", encoding="utf-8")
+        (self.files / "c.txt").write_text("c", encoding="utf-8")
+        data = self.client.post("/archive", json={
+            "dir": 0, "names": ["a file.txt", "b.txt", "c.txt"], "name": "abc", "type": "zip",
+        }).get_json()
+        (self.files / "c.txt").unlink()
+        self.assertTrue(self.run_worker())
+        job, _ = job_store.find(data["job_id"])
+        self.assertEqual(job["status"], "failed")
+        self.assertIn("c.txt", job["error"])
+        summary = job_store.item_summary(job)
+        self.assertEqual(summary["failed_names"], ["a file.txt", "b.txt", "c.txt"])
+        self.assertEqual(summary["remaining_names"], [])
+        self.assertEqual(summary["completed_names"], [])
+        self.assertEqual(summary["retry_count"], 3)
+        self.assertFalse((self.files / "abc.zip").exists())
+        records = operation_log.search("tester", operation="archive", outcome="failed")
+        self.assertTrue(records)
+        self.assertNotIn(records[0].get("item"), {"a file.txt", "b.txt"})
+
     def test_archive_route_rejects_unknown_format_before_queueing(self):
         self.sign_in()
         response = self.client.post("/archive", json={

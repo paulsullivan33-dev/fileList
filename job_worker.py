@@ -494,11 +494,21 @@ def _run_archive_job(job, path, directories):
     if folder is None or target is None or not os.path.isdir(folder):
         raise ValueError("The folder for this job no longer exists.")
     reporter = _ArchiveReporter(job, path)
-    job_store.start_item(path, names[0])
     if job["operation"] == "archive":
-        archive_ops.create_archive(root, folder, names, target,
-                                   destination_info.get("archive_type"), reporter=reporter)
+        # One archive is built from every selected item and published only if
+        # all succeed, so the job succeeds or fails as a unit. Marking a single
+        # item as current would blame names[0] for any failure and list the
+        # rest as not started; the error message names the actual item.
+        try:
+            archive_ops.create_archive(root, folder, names, target,
+                                       destination_info.get("archive_type"), reporter=reporter)
+        except JobCancelled:
+            raise
+        except Exception:
+            job_store.update(path, failed_names=list(names))
+            raise
     else:
+        job_store.start_item(path, names[0])
         if len(names) != 1:
             raise ValueError("Invalid queued extraction.")
         archive = safe_join(root, relative_path, names[0])
