@@ -51,6 +51,7 @@
 !/tests/test_worker_health.py
 !/tests/test_config_backups.py
 !/tests/test_run_scripts.py
+!/tests/test_rename_fallback.py
 !/tools/
 /tools/*
 !/tools/install.py
