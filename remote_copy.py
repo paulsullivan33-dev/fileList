@@ -4,13 +4,13 @@ import os
 import posixpath
 import re
 import shlex
-import shutil
 import subprocess
 import tempfile
 import time
-import worker_health
 from pathlib import Path
 
+# Shared with local transfers so measuring and source removal stay identical.
+from job_worker import _measure, _remove as _remove_source
 from utils import is_safe_path, is_safe_segment, remote_minimum_free_bytes, safe_dir_index, safe_join, user_can_access_directory, transfer_item, resolve_job_directory
 
 
@@ -252,24 +252,6 @@ def run_process(command, check_cancel):
                     process.wait()
 
 
-def _measure(path):
-    """Count transferable bytes without following symlinks."""
-    if os.path.islink(path):
-        return 0
-    if os.path.isfile(path):
-        return os.path.getsize(path)
-    total = 0
-    for root, directories, files in os.walk(path, followlinks=False):
-        worker_health.checkpoint()
-        directories[:] = [name for name in directories if not os.path.islink(os.path.join(root, name))]
-        for name in files:
-            worker_health.checkpoint()
-            candidate = os.path.join(root, name)
-            if not os.path.islink(candidate):
-                total += os.path.getsize(candidate)
-    return total
-
-
 def run_rsync(command, check_cancel, report_progress):
     """Run rsync while tailing its progress output without blocking on errors."""
     handle, log_name = tempfile.mkstemp(prefix="filelist-rsync-", suffix=".log")
@@ -319,18 +301,6 @@ def run_rsync(command, check_cancel, report_progress):
             os.unlink(log_name)
         except FileNotFoundError:
             pass
-
-
-def _remove_source(path):
-    """Remove a local source after its remote move has published.
-
-    Mirrors the local move's removal: real directories go recursively,
-    files and symlinks are unlinked.
-    """
-    if os.path.isdir(path) and not os.path.islink(path):
-        shutil.rmtree(path)
-    else:
-        os.remove(path)
 
 
 def run_job(job, job_path, directories, progress_class, check_cancel):
