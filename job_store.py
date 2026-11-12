@@ -103,10 +103,8 @@ def find(job_id):
 
 def create(operation, owner, source, destination, directories=None):
     if directories is not None:
-        from utils import bind_job_selection
-        source = bind_job_selection(source, directories)
-        if operation in {"copy", "move", "convert"}:
-            destination = bind_job_selection(destination, directories)
+        from utils import bind_job_selections
+        source, destination = bind_job_selections(operation, source, destination, directories)
     initialize()
     job_id = secrets.token_hex(16)
     record = {

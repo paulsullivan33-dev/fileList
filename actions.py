@@ -20,7 +20,7 @@ import transfer_preview
 import worker_health
 from utils import (
     authorize_job,
-    bind_job_selection,
+    bind_job_selections,
     current_user_groups,
     is_safe_path,
     is_safe_segment,
@@ -50,9 +50,7 @@ def _allowed_directory_indices(directories):
 def _enqueue_job(operation, source, destination, directories):
     owner = session.get("username")
     try:
-        source = bind_job_selection(source, directories)
-        if operation in {"copy", "move", "convert", "archive", "extract"}:
-            destination = bind_job_selection(destination, directories)
+        source, destination = bind_job_selections(operation, source, destination, directories)
         expected_preview = request.form.get("preview_signature")
         if expected_preview and expected_preview != transfer_preview.signature(operation, source, destination):
             raise ValueError("Folder configuration changed since the preview. Reopen the destination and check again.")

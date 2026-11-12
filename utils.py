@@ -228,6 +228,24 @@ def bind_job_selection(selection, directories):
     return selection
 
 
+# Operations whose destination is a configured local folder, so it is bound to
+# a stable folder identity at queue time like the source. Remote operations
+# bind only the source: their destination is a remote id, not a folder.
+LOCAL_DESTINATION_OPERATIONS = frozenset({"copy", "move", "convert", "archive", "extract"})
+
+
+def bind_job_selections(operation, source, destination, directories):
+    """Bind a new job's selections to stable folder identities.
+
+    The single place that decides what gets bound, used by both the web
+    routes and job_store.create, so the two cannot drift apart again.
+    """
+    source = bind_job_selection(source, directories)
+    if operation in LOCAL_DESTINATION_OPERATIONS:
+        destination = bind_job_selection(destination, directories)
+    return source, destination
+
+
 def authorize_job(job, directories, groups):
     """Resolve immutable folder references before checking current grants."""
     operation = job.get("operation")
