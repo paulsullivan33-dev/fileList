@@ -19,7 +19,7 @@ APPLICATION_FILES = (
     "tests/test_uploads.py", "tests/test_operation_log.py", "tests/test_create_text.py",
     "tests/test_transfer_preview.py", "tests/test_linux_integration.py", "tests/test_pagination.py",
     "tests/test_queue.py", "tests/test_worker_health.py", "tests/test_config_backups.py",
-    "tests/test_run_scripts.py", "tests/test_rename_fallback.py",
+    "tests/test_run_scripts.py", "tests/test_rename_fallback.py", "tests/test_session_revocation.py",
     "tools/check_config.py", "tools/config_backup.py",
 )
 
