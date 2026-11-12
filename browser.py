@@ -341,6 +341,8 @@ def register(app, DIRECTORIES):
             return "/?" + urllib.parse.urlencode({"dir": dir_index, "path": path, "page": number,
                 "per_page": listing["page_size"], "q": listing["query"] if query is None else query,
                 "sort": listing["sort"], "order": listing["order"]})
+        # Rendered above and below the table (see the return value), so it
+        # must not contain ids; loadFolderTotals updates both copies by class.
         navigation = "<nav class='listing-navigation' aria-label='Folder pages'>"
         if listing["page"] > 1:
             navigation += f"<a href='{html.escape(page_url(listing['page'] - 1), quote=True)}'>Previous</a> "
@@ -353,8 +355,9 @@ def register(app, DIRECTORIES):
             navigation += f"<a href='{html.escape(page_url(1, ''), quote=True)}'>Clear search</a> "
         navigation += (f"<span>· {dir_count} folders · {file_count} files · "
                        f"{format_size(total_size)} in displayed files</span> "
-                       "<button type='button' onclick='loadFolderTotals(this)'>Calculate folder totals</button> "
-                       "<span id='folderTotals' aria-live='polite'></span> ")
+                       "<button type='button' class='folder-totals-button' onclick='loadFolderTotals(this)'>"
+                       "Calculate folder totals</button> "
+                       "<span class='folder-totals' aria-live='polite'></span> ")
         fields = {"dir": dir_index, "path": path, "q": listing["query"],
                   "sort": listing["sort"], "order": listing["order"]}
         hidden_fields = "".join(f"<input type='hidden' name='{key}' value='{html.escape(str(value), quote=True)}'>"
@@ -440,7 +443,8 @@ def register(app, DIRECTORIES):
             <div class='statusbar' id='statusbar'>Selection is limited to this page.</div>
             <div id='jobsPanel'></div>
             """
-            + navigation + _inline_scripts()
+            + navigation.replace("aria-label='Folder pages'", "aria-label='Folder pages, bottom'", 1)
+            + _inline_scripts()
         )
 
 
@@ -739,19 +743,24 @@ function filterTable(event) {
 }
 
 async function loadFolderTotals(button) {
-    const output = document.getElementById('folderTotals');
-    button.disabled = true; output.textContent = 'Calculating…';
+    // The page navigation appears above and below the table; keep both
+    // copies (buttons and results) in step, whichever one was clicked.
+    const buttons = new Set([button, ...document.querySelectorAll('.folder-totals-button')]);
+    const outputs = document.querySelectorAll('.folder-totals');
+    const show = text => outputs.forEach(output => { output.textContent = text; });
+    buttons.forEach(b => { b.disabled = true; });
+    show('Calculating…');
     try {
         const query = new URLSearchParams({dir: document.getElementById('currentDir').value,
                                          path: document.getElementById('currentPath').value});
         const response = await fetch('/folder_stats?' + query);
         const data = await response.json().catch(() => ({}));
         if (!response.ok || !data.success) throw new Error(data.error || 'Could not calculate totals');
-        output.textContent = `Folder totals (direct contents): ${data.folders} folders · ${data.files} files · ${data.size}` +
-            (data.unavailable ? ` · ${data.unavailable} unavailable entries; totals are partial` : '');
-        button.textContent = 'Recalculate totals';
-    } catch (error) { output.textContent = error.message; }
-    finally { button.disabled = false; }
+        show(`Folder totals (direct contents): ${data.folders} folders · ${data.files} files · ${data.size}` +
+            (data.unavailable ? ` · ${data.unavailable} unavailable entries; totals are partial` : ''));
+        buttons.forEach(b => { b.textContent = 'Recalculate totals'; });
+    } catch (error) { show(error.message); }
+    finally { buttons.forEach(b => { b.disabled = false; }); }
 }
 
 // -----------------------------------------------------------------

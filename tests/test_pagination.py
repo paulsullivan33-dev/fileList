@@ -113,6 +113,16 @@ class PaginationTests(unittest.TestCase):
         self.assertIn("Page 1 of 1", self.page(q="absent"))
         self.assertEqual(self.names(self.page(q="absent")), [])
 
+    def test_navigation_shown_above_and_below_the_table_has_no_duplicate_ids(self):
+        page = self.page()
+        self.assertEqual(page.count("Calculate folder totals"), 2)
+        self.assertEqual(page.count("class='folder-totals'"), 2)
+        ids = re.findall(r"""\sid=['"]([^'"]+)['"]""", page)
+        duplicates = sorted({value for value in ids if ids.count(value) > 1})
+        self.assertEqual(duplicates, [])
+        self.assertIn("aria-label='Folder pages'", page)
+        self.assertIn("aria-label='Folder pages, bottom'", page)
+
     def test_totals_are_only_calculated_when_requested(self):
         with patch.object(folder_listing, "totals", wraps=folder_listing.totals) as totals:
             page = self.page()
@@ -148,9 +158,13 @@ const current = 'http://local/?dir=2&path=folder&page=3&per_page=25&q=old&sort=1
 const window = {location:{href:current,origin:'http://local',assign:url=>moves.push(new URL(url))}};
 const state = {sortCol:1,sortDir:'asc'};
 function saveState() {}
-const output = {};
-const fields = {searchInput:{value:'new match'},folderTotals:output,currentDir:{value:'2'},currentPath:{value:'folder'}};
-const document = {getElementById:id=>fields[id],querySelectorAll:()=>[]};
+// The navigation (button + result) is rendered above and below the table.
+const topOutput = {}, bottomOutput = {};
+const topButton = {disabled:false, textContent:'Calculate folder totals'};
+const bottomButton = {disabled:false, textContent:'Calculate folder totals'};
+const fields = {searchInput:{value:'new match'},currentDir:{value:'2'},currentPath:{value:'folder'}};
+const classes = {'.folder-totals':[topOutput,bottomOutput], '.folder-totals-button':[topButton,bottomButton]};
+const document = {getElementById:id=>fields[id],querySelectorAll:selector=>classes[selector] || []};
 let requests = 0;
 async function fetch(url) { requests++; return {ok:true,json:async()=>({success:true,folders:2,files:60,size:'1 KB',unavailable:1})}; }
 (async () => {
@@ -167,11 +181,19 @@ async function fetch(url) { requests++; return {ok:true,json:async()=>({success:
     assert.equal(moves[1].searchParams.get('q'),'new match');
     assert.equal(moves[1].searchParams.get('page'),'1');
     assert.equal(requests,0);
-    const button = {disabled:false};
-    await loadFolderTotals(button);
+    // Clicking the bottom button shows the result beside it (and keeps the
+    // top copy in step), instead of only in the off-screen top span.
+    const pending = loadFolderTotals(bottomButton);
+    assert.equal(bottomButton.disabled,true);
+    assert.equal(topButton.disabled,true);
+    await pending;
     assert.equal(requests,1);
-    assert.equal(button.disabled,false);
-    assert.match(output.textContent,/totals are partial/);
+    assert.equal(bottomButton.disabled,false);
+    assert.equal(topButton.disabled,false);
+    assert.match(bottomOutput.textContent,/totals are partial/);
+    assert.equal(topOutput.textContent,bottomOutput.textContent);
+    assert.equal(bottomButton.textContent,'Recalculate totals');
+    assert.equal(topButton.textContent,'Recalculate totals');
 })().catch(error=>{console.error(error);process.exitCode=1;});
 """
         result = subprocess.run([shutil.which("node"), "-e", functions + harness], capture_output=True, text=True)
