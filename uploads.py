@@ -9,7 +9,7 @@ import operation_log
 from werkzeug.utils import secure_filename
 from job_worker import _rename_without_replace
 
-from utils import configured_bytes, ensure_free_space, is_safe_path, is_safe_segment, safe_join, safe_dir_index
+from utils import FreeSpaceGuard, configured_bytes, ensure_free_space, is_safe_path, is_safe_segment, safe_join, safe_dir_index
 
 
 # -----------------------------------------------------------------
@@ -84,8 +84,13 @@ def _fix_publish_mode(fileno):
     service runs as, and Paul could not open them later from his Mac
     (he browses the shares as a different user). Set the mode the
     rest of the app publishes with (archive_ops uses 0644) on the
-    temp file before it is renamed into place."""
-    os.fchmod(fileno, 0o644)
+    temp file before it is renamed into place.
+
+    Only where Unix permission bits exist: Windows has no os.fchmod before
+    Python 3.13 (an AttributeError the upload routes do not catch), and
+    there access is governed by NTFS ACLs, not mode bits."""
+    if os.name != "nt" and hasattr(os, "fchmod"):
+        os.fchmod(fileno, 0o644)
 
 
 def _save_stream(fs, target_dir, max_size):
@@ -98,6 +103,7 @@ def _save_stream(fs, target_dir, max_size):
 
     descriptor, temporary = tempfile.mkstemp(prefix=".filelist-upload-", suffix=".partial", dir=target_dir)
     written = 0
+    space = FreeSpaceGuard(target_dir, check=ensure_free_space)
     try:
         with os.fdopen(descriptor, "wb") as out:
             while True:
@@ -107,7 +113,7 @@ def _save_stream(fs, target_dir, max_size):
                 written += len(buf)
                 if written > max_size:
                     raise ValueError(f"file too large (max {max_size} bytes)")
-                ensure_free_space(target_dir, len(buf))
+                space.before_write(len(buf))
                 out.write(buf)
             out.flush()
             os.fsync(out.fileno())

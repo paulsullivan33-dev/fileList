@@ -98,6 +98,47 @@ class JobIdentityTests(unittest.TestCase):
         self.run_worker(reordered)
         self.assertEqual((self.target / "item.txt").read_text(), "original")
 
+    def test_archive_and_extract_jobs_created_with_directories_run(self):
+        # job_store.create used to bind only copy/move/convert destinations,
+        # so these jobs were queued unbound and always failed in the worker.
+        archive = job_store.create("archive", "tester",
+            {"directory_index": 0, "path": "", "names": ["item.txt"]},
+            {"directory_index": 0, "path": "", "names": ["bundle.zip"], "archive_type": "zip"},
+            directories=self.directories)
+        self.assertIn("directory_id", archive["destination"])
+        self.run_worker(list(reversed(self.directories)))
+        stored, _ = job_store.find(archive["job_id"])
+        self.assertEqual(stored["status"], "complete", stored["error"])
+        self.assertTrue((self.source / "bundle.zip").is_file())
+
+        extract = job_store.create("extract", "tester",
+            {"directory_index": 0, "path": "", "names": ["bundle.zip"]},
+            {"directory_index": 0, "path": "", "names": ["bundle"]},
+            directories=self.directories)
+        self.run_worker(list(reversed(self.directories)))
+        stored, _ = job_store.find(extract["job_id"])
+        self.assertEqual(stored["status"], "complete", stored["error"])
+        self.assertEqual((self.source / "bundle" / "item.txt").read_text(), "original")
+
+    def test_routes_and_job_store_share_one_binding_rule(self):
+        import inspect
+        import actions
+        import utils
+        self.assertNotIn("bind_job_selection(", inspect.getsource(actions._enqueue_job))
+        selection = {"directory_index": 0, "path": "", "names": ["item.txt"]}
+        local_destination = {"directory_index": 1, "path": "", "names": ["item.txt"]}
+        remote_destination = {"remote_id": "backup", "path": "", "names": ["item.txt"]}
+        for operation in ("copy", "move", "convert", "archive", "extract", "remote_copy", "remote_move"):
+            with self.subTest(operation=operation):
+                remote = operation.startswith("remote_")
+                destination = remote_destination if remote else local_destination
+                expected = utils.bind_job_selections(operation, selection, destination, self.directories)
+                created = job_store.create(operation, "tester", selection, destination,
+                                           directories=self.directories)
+                self.assertEqual((created["source"], created["destination"]), expected)
+                self.assertEqual("directory_id" in created["destination"], not remote)
+                self.assertEqual(operation in utils.LOCAL_DESTINATION_OPERATIONS, not remote)
+
     def test_permissions_follow_identity_after_reordering(self):
         job = self.job()
         reordered = [self.directories[1], Directory(str(self.source), "/source", "Source", "private", "source")]

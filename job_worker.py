@@ -16,7 +16,7 @@ import config_loader
 import job_store
 import operation_log
 import worker_health
-from utils import authorize_job, current_user_groups, ensure_free_space, is_safe_path, is_safe_segment, safe_dir_index, safe_join, transfer_item, resolve_job_directory
+from utils import FreeSpaceGuard, authorize_job, current_user_groups, ensure_free_space, is_safe_path, is_safe_segment, safe_dir_index, safe_join, transfer_item, resolve_job_directory
 
 
 CHUNK_SIZE = 4 * 1024 * 1024
@@ -91,9 +91,19 @@ def _rename_without_replace(source, destination):
     if os.name != "nt" and not (os.path.isdir(source) and not os.path.islink(source)):
         if _link_noreplace(source, destination):
             return
-    if os.path.lexists(destination):
-        raise FileExistsError(errno.EEXIST, "File exists", destination)
-    os.rename(source, destination)
+    for attempt in range(20 if os.name == "nt" else 1):
+        if os.path.lexists(destination):
+            raise FileExistsError(errno.EEXIST, "File exists", destination)
+        try:
+            os.rename(source, destination)
+            return
+        except PermissionError:
+            # Windows refuses to rename an entry that another process (often
+            # antivirus or the indexer scanning freshly written files) has
+            # open; that clears within milliseconds. Elsewhere, re-raise.
+            if os.name != "nt" or attempt == 19:
+                raise
+            time.sleep(0.05)
 
 
 def _check_cancel(job_id):
@@ -147,14 +157,20 @@ class Progress:
             self.last_update = now
 
 
-def _copy_file(source, destination, progress):
+def _space_guard(directory):
+    # Looked up here so tests that patch job_worker.ensure_free_space apply.
+    return FreeSpaceGuard(directory, check=ensure_free_space)
+
+
+def _copy_file(source, destination, progress, space=None):
+    space = space or _space_guard(os.path.dirname(destination))
     with open(source, "rb") as input_file, open(destination, "xb") as output_file:
         while True:
             _check_cancel(progress.job["job_id"])
             chunk = input_file.read(CHUNK_SIZE)
             if not chunk:
                 break
-            ensure_free_space(os.path.dirname(destination), len(chunk))
+            space.before_write(len(chunk))
             output_file.write(chunk)
             progress.add(len(chunk))
         output_file.flush()
@@ -162,7 +178,10 @@ def _copy_file(source, destination, progress):
     shutil.copystat(source, destination, follow_symlinks=False)
 
 
-def _copy_tree(source, destination, progress):
+def _copy_tree(source, destination, progress, space=None):
+    # One guard for the whole tree: every file lands on the same filesystem,
+    # so a folder of many small files no longer costs a check per file.
+    space = space or _space_guard(os.path.dirname(destination))
     os.mkdir(destination)
     for root, directories, files in os.walk(source, topdown=True, followlinks=False):
         _check_cancel(progress.job["job_id"])
@@ -182,7 +201,7 @@ def _copy_tree(source, destination, progress):
             if os.path.islink(source_item):
                 os.symlink(os.readlink(source_item), target_item)
             else:
-                _copy_file(source_item, target_item, progress)
+                _copy_file(source_item, target_item, progress, space)
     for root, directories, _ in os.walk(source, topdown=False, followlinks=False):
         relative = os.path.relpath(root, source)
         target_root = destination if relative == "." else os.path.join(destination, relative)
@@ -196,10 +215,12 @@ def _remove(path):
         os.remove(path)
 
 
-def _copy_staged(source, destination, progress):
+def _copy_staged(source, destination, progress, size=None):
+    """Copy via a hidden staging name, then publish. `size` is the source's
+    measured size when the caller already walked it (saves a second walk)."""
     if os.path.lexists(destination):
         raise FileExistsError(f"Destination already exists: {os.path.basename(destination)}")
-    ensure_free_space(os.path.dirname(destination), _measure(source))
+    ensure_free_space(os.path.dirname(destination), _measure(source) if size is None else size)
     temporary = os.path.join(
         os.path.dirname(destination),
         f".{os.path.basename(destination)}.{uuid.uuid4().hex}.partial",
@@ -208,10 +229,12 @@ def _copy_staged(source, destination, progress):
     try:
         if os.path.islink(source):
             os.symlink(os.readlink(source), temporary, target_is_directory=os.path.isdir(source))
-        elif os.path.isdir(source):
-            _copy_tree(source, temporary, progress)
         else:
-            _copy_file(source, temporary, progress)
+            space = _space_guard(os.path.dirname(destination))
+            if os.path.isdir(source):
+                _copy_tree(source, temporary, progress, space)
+            else:
+                _copy_file(source, temporary, progress, space)
         _check_cancel(progress.job["job_id"])
         if os.path.lexists(destination):
             raise FileExistsError(f"Destination already exists: {os.path.basename(destination)}")
@@ -267,16 +290,19 @@ def _validated_items(job, directories, job_path=None):
 
 def _run_transfer(job, path, directories):
     items = _validated_items(job, directories, path)
-    total = 0
+    # Walk each item once; the sizes are reused for the free-space check and
+    # for progress, instead of walking the tree again later.
+    sizes = []
     for name, (source, _) in zip(job["source"]["names"], items):
         job_store.start_item(path, name)
         with transfer_item(name):
-            total += _measure(source)
+            sizes.append(_measure(source))
+    total = sum(sizes)
     job_store.update(path, current_name=None)
     if job["operation"] == "copy":
         ensure_free_space(os.path.dirname(items[0][1]), total)
     progress = Progress(job, path, total)
-    for name, (source, destination) in zip(job["source"]["names"], items):
+    for name, (source, destination), size in zip(job["source"]["names"], items, sizes):
         job_store.start_item(path, name)
         with transfer_item(name):
             _check_cancel(job["job_id"])
@@ -284,12 +310,15 @@ def _run_transfer(job, path, directories):
                 try:
                     _rename_without_replace(source, destination)
                     job_store.complete_item(path, name)
-                    progress.add(_measure(destination), force=True)
+                    # Already measured: a same-filesystem move is a rename,
+                    # and walking the moved tree again cost as much as
+                    # listing it over the network.
+                    progress.add(size, force=True)
                     continue
                 except OSError as error:
                     if error.errno != errno.EXDEV:
                         raise
-            _copy_staged(source, destination, progress)
+            _copy_staged(source, destination, progress, size)
             if job["operation"] == "move":
                 try:
                     _remove(source)
@@ -494,11 +523,21 @@ def _run_archive_job(job, path, directories):
     if folder is None or target is None or not os.path.isdir(folder):
         raise ValueError("The folder for this job no longer exists.")
     reporter = _ArchiveReporter(job, path)
-    job_store.start_item(path, names[0])
     if job["operation"] == "archive":
-        archive_ops.create_archive(root, folder, names, target,
-                                   destination_info.get("archive_type"), reporter=reporter)
+        # One archive is built from every selected item and published only if
+        # all succeed, so the job succeeds or fails as a unit. Marking a single
+        # item as current would blame names[0] for any failure and list the
+        # rest as not started; the error message names the actual item.
+        try:
+            archive_ops.create_archive(root, folder, names, target,
+                                       destination_info.get("archive_type"), reporter=reporter)
+        except JobCancelled:
+            raise
+        except Exception:
+            job_store.update(path, failed_names=list(names))
+            raise
     else:
+        job_store.start_item(path, names[0])
         if len(names) != 1:
             raise ValueError("Invalid queued extraction.")
         archive = safe_join(root, relative_path, names[0])
