@@ -25,6 +25,7 @@ class CreateTextHelperTests(unittest.TestCase):
         self.assertEqual((self.root / "notes.txt").read_bytes(), data.encode("utf-8"))
         self.assertFalse(list(self.root.glob("*.partial")))
 
+    @unittest.skipIf(os.name == "nt", "Unix permission bits; Windows uses NTFS ACLs")
     def test_created_file_is_world_readable(self):
         # Regression (Paul, 2026-11-09): the mkstemp 0600 mode survived
         # publication, so a file created here could not be read later

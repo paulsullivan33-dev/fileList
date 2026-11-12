@@ -61,6 +61,7 @@ class ArchiveTests(unittest.TestCase):
                 self.create(kind)
             self.assertEqual(target.read_bytes(), b"existing archive")
 
+    @unittest.skipIf(os.name == "nt", "Unix permission bits; Windows uses NTFS ACLs")
     def test_extracted_tree_gets_standard_readable_permissions(self):
         # Even under a restrictive service umask, the extracted folder and
         # its contents must come out readable (the staging directory starts

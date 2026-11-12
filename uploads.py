@@ -84,8 +84,13 @@ def _fix_publish_mode(fileno):
     service runs as, and Paul could not open them later from his Mac
     (he browses the shares as a different user). Set the mode the
     rest of the app publishes with (archive_ops uses 0644) on the
-    temp file before it is renamed into place."""
-    os.fchmod(fileno, 0o644)
+    temp file before it is renamed into place.
+
+    Only where Unix permission bits exist: Windows has no os.fchmod before
+    Python 3.13 (an AttributeError the upload routes do not catch), and
+    there access is governed by NTFS ACLs, not mode bits."""
+    if os.name != "nt" and hasattr(os, "fchmod"):
+        os.fchmod(fileno, 0o644)
 
 
 def _save_stream(fs, target_dir, max_size):

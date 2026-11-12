@@ -2,6 +2,7 @@ import json
 import os
 import secrets
 import tempfile
+import time
 import operation_log
 from datetime import datetime, timezone
 from pathlib import Path
@@ -41,6 +42,27 @@ def _job_path(state, job_id):
     return job_root() / state / f"{job_id}.json"
 
 
+def _replace(source, destination):
+    """os.replace, retried briefly on Windows.
+
+    Windows refuses to replace a file that another process has open, and
+    antivirus or the search indexer often opens a freshly written job file
+    for a few milliseconds, which made writes fail at random with
+    "Access is denied". POSIX has no such restriction.
+    """
+    if os.name != "nt":
+        os.replace(source, destination)
+        return
+    for attempt in range(20):
+        try:
+            os.replace(source, destination)
+            return
+        except PermissionError:
+            if attempt == 19:
+                raise
+            time.sleep(0.05)
+
+
 def _atomic_write(path, data):
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -51,7 +73,7 @@ def _atomic_write(path, data):
             output.write("\n")
             output.flush()
             os.fsync(output.fileno())
-        os.replace(temporary, path)
+        _replace(temporary, path)
     except Exception:
         try:
             os.remove(temporary)

@@ -24,6 +24,7 @@ class UploadTests(unittest.TestCase):
         file = FileStorage(stream=io.BytesIO(content), filename=name)
         return uploads._save_stream(file, str(self.root), limit)
 
+    @unittest.skipIf(os.name == "nt", "Unix permission bits; Windows uses NTFS ACLs")
     def test_uploaded_file_is_world_readable(self):
         # Regression (Paul, 2026-11-09): same mkstemp 0600 leak as the
         # create-text path — uploaded files published owner-only.

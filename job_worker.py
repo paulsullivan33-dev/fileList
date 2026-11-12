@@ -91,9 +91,19 @@ def _rename_without_replace(source, destination):
     if os.name != "nt" and not (os.path.isdir(source) and not os.path.islink(source)):
         if _link_noreplace(source, destination):
             return
-    if os.path.lexists(destination):
-        raise FileExistsError(errno.EEXIST, "File exists", destination)
-    os.rename(source, destination)
+    for attempt in range(20 if os.name == "nt" else 1):
+        if os.path.lexists(destination):
+            raise FileExistsError(errno.EEXIST, "File exists", destination)
+        try:
+            os.rename(source, destination)
+            return
+        except PermissionError:
+            # Windows refuses to rename an entry that another process (often
+            # antivirus or the indexer scanning freshly written files) has
+            # open; that clears within milliseconds. Elsewhere, re-raise.
+            if os.name != "nt" or attempt == 19:
+                raise
+            time.sleep(0.05)
 
 
 def _check_cancel(job_id):
