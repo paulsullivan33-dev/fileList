@@ -199,9 +199,16 @@ def _flatten_duplicate_wrapper(staging, target):
     inner = os.path.join(staging, entries[0])
     if entries[0] != os.path.basename(target) or not os.path.isdir(inner):
         return
-    for child in os.listdir(inner):
-        os.rename(os.path.join(inner, child), os.path.join(staging, child))
-    os.rmdir(inner)
+    # Move the wrapper aside first: it may itself contain an entry with its
+    # own name (books/books/...), which could not be moved up while the
+    # wrapper still occupies that name. Staging then holds only the holder,
+    # so no child can collide.
+    holder = tempfile.mkdtemp(prefix=".filelist-wrapper-", dir=staging)
+    os.rmdir(holder)
+    os.rename(inner, holder)
+    for child in os.listdir(holder):
+        os.rename(os.path.join(holder, child), os.path.join(staging, child))
+    os.rmdir(holder)
 
 
 def _normalize_permissions(staging):

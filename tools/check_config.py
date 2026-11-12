@@ -57,6 +57,18 @@ def check_users(path):
     return [f"Users: {len(names)} configured"], errors
 
 
+def check_private_file(path, label):
+    """Warn when a file holding secrets is readable by group or others."""
+    path = Path(path)
+    if os.name != "posix" or not path.exists():
+        return []
+    mode = path.stat().st_mode & 0o777
+    if mode & 0o077:
+        return [f"{label} is readable by other accounts (mode {mode:04o}): {path}. "
+                f"Run: chmod 600 {shlex.quote(str(path))}"]
+    return []
+
+
 def check_writable_location(path, label):
     path = Path(path)
     if path.exists() and not path.is_dir():
@@ -114,14 +126,22 @@ def check_runtime(require_remote_tools=False):
     return messages, errors
 
 
-def check_remotes(verify_ssh=False):
+def check_remotes(verify_ssh=False, strict=False):
+    """Check remote destinations; returns (messages, errors, warnings).
+
+    A remote_destinations.json that cannot be read is an error. A remote that
+    cannot be reached, or whose folder is missing or read-only, is only a
+    warning unless strict is set: it depends on another machine's current
+    state, and local browsing, uploads and copies work without it.
+    """
     try:
         destinations = remote_copy.load_destinations()
     except (OSError, ValueError, json.JSONDecodeError) as error:
-        return [], [f"Remote destinations: {error}"]
+        return [], [f"Remote destinations: {error}"], []
     if not destinations:
-        return ["Remote destinations: none configured"], []
-    messages, errors = [], []
+        return ["Remote destinations: none configured"], [], []
+    messages, errors, warnings = [], [], []
+    unreachable = errors if strict else warnings
     for destination in destinations:
         label = f"{destination['name']} ({destination['host']}:{destination['path']})"
         if not verify_ssh:
@@ -136,35 +156,39 @@ def check_remotes(verify_ssh=False):
                                     stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                                     timeout=20, check=False)
         except OSError as error:
-            errors.append(f"Remote destination failed to start SSH: {label}: {error}")
+            unreachable.append(f"Remote destination failed to start SSH: {label}: {error}")
             continue
         except subprocess.TimeoutExpired:
-            errors.append(f"Remote destination timed out: {label}")
+            unreachable.append(f"Remote destination timed out: {label}")
             continue
         if result.returncode:
-            errors.append(f"Remote destination unavailable: {label}: {result.stdout.strip()[-500:]}")
+            unreachable.append(f"Remote destination unavailable: {label}: {result.stdout.strip()[-500:]}")
         else:
             messages.append("Remote destination verified: " + label)
-    return messages, errors
+    return messages, errors, warnings
 
 
-def validate_startup(config=None, users=None, verify_ssh=False):
+def validate_startup(config=None, users=None, verify_ssh=False, strict=False):
+    """Returns (messages, errors, warnings); only errors should block startup."""
     config = Path(config or os.environ.get("FILELIST_CONFIG", ROOT / "directories.json")).expanduser()
     users = Path(users or ROOT / "users.json")
     directory_check = check_directories(config)
     user_check = check_users(users)
-    remote_check = check_remotes(verify_ssh)
+    remote_messages, remote_errors, warnings = check_remotes(verify_ssh, strict)
+    warnings = check_private_file(users, "users.json (password hashes)") + warnings
+    remote_check = (remote_messages, remote_errors)
     try:
         require_remote_tools = bool(remote_copy.load_destinations())
     except (OSError, ValueError):
         require_remote_tools = False
     runtime_check = check_runtime(require_remote_tools)
     return ([message for check in (directory_check, user_check, remote_check, runtime_check) for message in check[0]],
-            [error for check in (directory_check, user_check, remote_check, runtime_check) for error in check[1]])
+            [error for check in (directory_check, user_check, remote_check, runtime_check) for error in check[1]],
+            warnings)
 
 
 def require_startup(config=None, users=None):
-    _, errors = validate_startup(config, users)
+    _, errors, _ = validate_startup(config, users)
     if errors:
         raise RuntimeError("fileList cannot start:\n" + "\n".join(errors))
 
@@ -172,16 +196,23 @@ def require_startup(config=None, users=None):
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--ssh", action="store_true", help="Verify passwordless SSH, remote write access, and rsync")
+    parser.add_argument("--strict", action="store_true",
+                        help="With --ssh, fail when a remote destination is unreachable (default: warn)")
     args = parser.parse_args(argv)
-    messages, errors = validate_startup(verify_ssh=args.ssh)
+    messages, errors, warnings = validate_startup(verify_ssh=args.ssh, strict=args.strict)
     for message in messages:
         print("OK:", message)
+    for warning in warnings:
+        print("WARNING:", warning)
     for error in errors:
         print("ERROR:", error)
     if errors:
         print(f"Configuration check failed with {len(errors)} error(s).")
         return 1
-    print("Configuration check passed.")
+    if warnings:
+        print(f"Configuration check passed with {len(warnings)} warning(s).")
+    else:
+        print("Configuration check passed.")
     return 0
 
 

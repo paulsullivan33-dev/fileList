@@ -106,10 +106,16 @@ server change:
 
 Add `--ssh` to verify each configured remote destination with the same account
 that runs fileList. It checks passwordless SSH, remote-directory write access,
-and remote `rsync` availability without copying files.
+and remote `rsync` availability without copying files. An unreachable remote,
+or a remote folder that is missing or not writable, is reported as a `WARNING`
+and does not fail the check; add `--strict` to treat it as an error (for
+example, when verifying a new deployment).
 
 `start` and `run.sh` now perform this check automatically, including remote
-availability, before launching either process. Direct Flask and worker launches
+availability, before launching either process. Configuration errors stop the
+launch; a remote destination that is down only prints a warning, so local
+browsing and transfers still start. `run.sh` checks once in the foreground and
+the background launcher does not repeat it. Direct Flask and worker launches
 also validate local configuration and required tools. Fix the numbered entries
 or named settings reported in the error before restarting. Missing configured
 folders are never created automatically: create the intended folder or restore
@@ -144,9 +150,17 @@ python -c "from werkzeug.security import generate_password_hash; print(generate_
 ```
 
 Paste the generated value into `users.json`; never store a plain-text password there.
+Keep `users.json` private to the account that runs fileList (`chmod 600 users.json`).
+`manage_user.py` sets that mode on every save, and `tools/check_config.py` warns
+when the file is readable by other accounts.
 
 `manage_user.py` now saves a dated backup before replacing existing user settings.
 Backups live beside the original file in `.config-backups/<UTC timestamp>-<id>/`.
+Backups can contain password hashes, so their folders are created 0700 and the
+copies 0600. Restoring over an existing file keeps that file's current mode; a
+restore to a new path uses the mode the original had. Delete backups
+you no longer need. To tighten backups made by older versions, run
+`chmod -R go-rwx .config-backups`.
 Use the same helpers before manually editing other JSON configuration files:
 
 ```bash

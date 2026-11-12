@@ -25,7 +25,7 @@ rm -f "$pid_file"
 ./start --check
 # setsid gives the launcher its own process group, so ./stop.sh can stop the
 # launcher, the app and the worker together, even if the launcher is killed.
-nohup setsid ./start > run.log 2>&1 &
+FILELIST_PRECHECKED=1 nohup setsid ./start > run.log 2>&1 &
 pid=$!
 echo "$pid" > "$pid_file"
 disown "$pid"

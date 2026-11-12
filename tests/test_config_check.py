@@ -104,12 +104,44 @@ class ConfigCheckTests(unittest.TestCase):
         remote = {"name": "Backup", "host": "backup", "path": "/missing", "group": "members"}
         with patch.object(check_config.remote_copy, "load_destinations", return_value=[remote]), \
                 patch.object(check_config.subprocess, "run") as run:
-            _, errors = check_config.check_remotes(False)
-            self.assertEqual(errors, [])
+            _, errors, warnings = check_config.check_remotes(False)
+            self.assertEqual((errors, warnings), ([], []))
             run.assert_not_called()
             run.return_value = type("Result", (), {"returncode": 1, "stdout": "Folder unavailable"})()
-            _, errors = check_config.check_remotes(True)
+            _, errors, warnings = check_config.check_remotes(True)
+            self.assertEqual(errors, [])
+            self.assertTrue(any("Backup" in warning and "Folder unavailable" in warning for warning in warnings))
+            _, errors, warnings = check_config.check_remotes(True, strict=True)
+            self.assertEqual(warnings, [])
             self.assertTrue(any("Backup" in error and "Folder unavailable" in error for error in errors))
+
+    def test_unreachable_remote_warns_without_failing_unless_strict(self):
+        remote = {"name": "Backup", "host": "backup", "path": "/srv", "group": "members"}
+        timeout = subprocess.TimeoutExpired(cmd="ssh", timeout=20)
+        with patch.object(check_config.remote_copy, "load_destinations", return_value=[remote]),                 patch.object(check_config.subprocess, "run", side_effect=timeout),                 patch.object(check_config, "check_directories", return_value=([], [])),                 patch.object(check_config, "check_users", return_value=([], [])),                 patch.object(check_config, "check_runtime", return_value=([], [])),                 patch("sys.stdout") as stdout:
+            self.assertEqual(check_config.main(["--ssh"]), 0)
+            output = "".join(call.args[0] for call in stdout.write.call_args_list)
+            self.assertIn("WARNING: Remote destination timed out: Backup", output)
+            self.assertEqual(check_config.main(["--ssh", "--strict"]), 1)
+
+    @unittest.skipUnless(os.name == "posix", "POSIX permission modes")
+    def test_readable_users_file_is_a_warning_with_the_fix(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            users = Path(temporary) / "users.json"
+            users.write_text("[]", encoding="utf-8")
+            users.chmod(0o644)
+            warnings = check_config.check_private_file(users, "users.json")
+            self.assertEqual(len(warnings), 1)
+            self.assertIn("0644", warnings[0])
+            self.assertIn("chmod 600", warnings[0])
+            users.chmod(0o600)
+            self.assertEqual(check_config.check_private_file(users, "users.json"), [])
+
+    def test_unreadable_remote_destinations_file_is_still_an_error(self):
+        with patch.object(check_config.remote_copy, "load_destinations", side_effect=ValueError("bad JSON")):
+            _, errors, warnings = check_config.check_remotes(True)
+        self.assertEqual(warnings, [])
+        self.assertTrue(any("bad JSON" in error for error in errors))
 
     @unittest.skipUnless(os.name == "posix", "Bash launcher test requires Linux/POSIX")
     def test_launcher_stops_before_starting_processes_when_preflight_fails(self):
@@ -126,6 +158,23 @@ class ConfigCheckTests(unittest.TestCase):
             self.assertNotEqual(result.returncode, 0)
             self.assertIn("Configuration is invalid", result.stdout)
             self.assertFalse((root / "unexpected-start").exists())
+
+    @unittest.skipUnless(os.name == "posix", "Bash launcher test requires Linux/POSIX")
+    def test_launcher_skips_repeat_check_when_run_sh_already_checked(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            start = root / "start"
+            start.write_bytes((ROOT / "start").read_bytes())
+            (root / "tools").mkdir()
+            (root / "tools" / "check_config.py").write_text("from pathlib import Path\nPath('checked').touch()\n")
+            for name in ("job_worker.py", "app.py"):
+                (root / name).write_text("")
+            environment = {**os.environ, "PYTHON_BIN": sys.executable}
+            subprocess.run(["bash", str(start)], env={**environment, "FILELIST_PRECHECKED": "1"},
+                           capture_output=True, text=True, timeout=10)
+            self.assertFalse((root / "checked").exists())
+            subprocess.run(["bash", str(start)], env=environment, capture_output=True, text=True, timeout=10)
+            self.assertTrue((root / "checked").exists())
 
 
 if __name__ == "__main__":

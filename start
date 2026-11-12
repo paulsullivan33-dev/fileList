@@ -8,7 +8,12 @@ else
     PYTHON_BIN="${PYTHON_BIN:-python3}"
 fi
 
-"$PYTHON_BIN" tools/check_config.py --ssh
+# run.sh runs this check in the foreground (./start --check) before it starts
+# the launcher in the background, and sets FILELIST_PRECHECKED so the slow SSH
+# probe is not repeated. An unreachable remote destination is only a warning.
+if [[ -z "${FILELIST_PRECHECKED:-}" ]]; then
+    "$PYTHON_BIN" tools/check_config.py --ssh
+fi
 if [[ "${1:-}" == "--check" ]]; then
     exit 0
 fi

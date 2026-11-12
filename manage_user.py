@@ -26,7 +26,9 @@ def main(argv=None):
     users = [user for user in users if user.get("username") != args.username]
     users.append(dict(username=args.username, password=generate_password_hash(password), groups=args.groups))
     try:
-        previous = config_backups.write_json(path, users)
+        # users.json holds password hashes: keep it private to the service
+        # account, even if it was created by copying users.example.json.
+        previous = config_backups.write_json(path, users, force_mode=0o600)
     except OSError as error:
         parser.error(f"User settings were not saved: {error}")
     if previous:

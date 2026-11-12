@@ -114,7 +114,8 @@ Run checks after installation with:
 
 Use `.venv/bin/python tools/check_config.py --ssh` after configuring remote
 destinations to verify SSH, remote write access, and rsync without transferring
-files.
+files. Add `--strict` to make an unreachable remote fail the check; without it,
+an unreachable remote is only a warning.
 
 After upgrading, reload the browser to load the new upload queue and retry controls.
 Failed uploads remain visible until you choose **Refresh file list**. Transfer

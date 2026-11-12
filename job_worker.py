@@ -32,25 +32,68 @@ class JobCancelled(Exception):
     pass
 
 
-def _rename_without_replace(source, destination):
-    """Use Linux renameat2 so a late destination collision cannot overwrite data."""
-    if os.name == "nt":
-        if os.path.lexists(destination):
-            raise FileExistsError(destination)
-        os.rename(source, destination)
-        return
+# renameat2 reports these when the kernel, libc or filesystem (NFS, many FUSE
+# filesystems) cannot do RENAME_NOREPLACE; anything else is a real failure.
+_NOREPLACE_UNSUPPORTED = {errno.EINVAL, errno.ENOSYS, errno.ENOTSUP, errno.EOPNOTSUPP}
+# os.link reports these when the filesystem has no hard links.
+_LINK_UNSUPPORTED = _NOREPLACE_UNSUPPORTED | {errno.EPERM, errno.EMLINK}
+
+
+def _renameat2_noreplace(source, destination):
+    """Atomic no-replace rename. Returns False when it is unsupported here."""
     if not sys.platform.startswith("linux"):
-        raise OSError(errno.ENOTSUP, "Atomic no-replace rename is unavailable on this system.")
-    libc = ctypes.CDLL(None, use_errno=True)
-    renameat2 = getattr(libc, "renameat2", None)
+        return False
+    renameat2 = getattr(ctypes.CDLL(None, use_errno=True), "renameat2", None)
     if renameat2 is None:
-        raise OSError(errno.ENOTSUP, "Atomic no-replace rename is unavailable on this system.")
+        return False
     result = renameat2(
         AT_FDCWD, os.fsencode(source), AT_FDCWD, os.fsencode(destination), RENAME_NOREPLACE
     )
-    if result != 0:
-        error_number = ctypes.get_errno()
-        raise OSError(error_number, os.strerror(error_number), destination)
+    if result == 0:
+        return True
+    error_number = ctypes.get_errno()
+    if error_number in _NOREPLACE_UNSUPPORTED:
+        return False
+    raise OSError(error_number, os.strerror(error_number), destination)
+
+
+def _link_noreplace(source, destination):
+    """Publish a file (or symlink) by hard link, which fails if the name exists.
+
+    Returns False when the filesystem has no hard links. EXDEV and EEXIST
+    propagate: moves rely on EXDEV to fall back to copying.
+    """
+    try:
+        os.link(source, destination, follow_symlinks=False)
+    except OSError as error:
+        if error.errno in _LINK_UNSUPPORTED:
+            return False
+        raise
+    try:
+        os.unlink(source)
+    except OSError:
+        # Keep the operation all-or-nothing: withdraw the new name.
+        os.unlink(destination)
+        raise
+    return True
+
+
+def _rename_without_replace(source, destination):
+    """Rename source to destination without ever replacing an existing entry.
+
+    Prefers Linux renameat2(RENAME_NOREPLACE). Filesystems without it (NFS,
+    many FUSE mounts) fall back to a hard link for files, which is equally
+    atomic, and finally, for folders or filesystems without hard links, to
+    check-then-rename, which leaves a tiny window for a racing writer.
+    """
+    if os.name != "nt" and _renameat2_noreplace(source, destination):
+        return
+    if os.name != "nt" and not (os.path.isdir(source) and not os.path.islink(source)):
+        if _link_noreplace(source, destination):
+            return
+    if os.path.lexists(destination):
+        raise FileExistsError(errno.EEXIST, "File exists", destination)
+    os.rename(source, destination)
 
 
 def _check_cancel(job_id):
