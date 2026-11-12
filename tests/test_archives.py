@@ -90,6 +90,44 @@ class ArchiveTests(unittest.TestCase):
         self.assertEqual((target / "sub" / "deep.txt").read_text(encoding="utf-8"), "deep")
         self.assertFalse((target / "wrap").exists())
 
+    def test_wrapper_containing_its_own_name_is_flattened_once(self):
+        # books.zip -> books/books/... used to fail with ENOTEMPTY/EISDIR,
+        # because the inner entry was moved onto the wrapper still holding
+        # that name.
+        def write_zip(path, members):
+            with zipfile.ZipFile(path, "w") as archive:
+                for name, contents in members.items():
+                    archive.writestr(name, contents)
+
+        def write_tar(path, members):
+            with tarfile.open(path, "w") as archive:
+                for name, contents in members.items():
+                    data = contents.encode("utf-8")
+                    info = tarfile.TarInfo(name)
+                    info.size = len(data)
+                    archive.addfile(info, io.BytesIO(data))
+
+        cases = {
+            "folder": {"books/books/ch1.txt": "one", "books/intro.txt": "intro"},
+            "file": {"books/books": "a file named like the wrapper", "books/intro.txt": "intro"},
+        }
+        for kind, writer in (("zip", write_zip), ("tar", write_tar)):
+            for case, members in cases.items():
+                with self.subTest(kind=kind, inner=case):
+                    parent = self.root / f"{kind}-{case}"
+                    parent.mkdir()
+                    source = parent / f"books.{kind}"
+                    writer(source, members)
+                    target = parent / "books"
+                    self.extract(source, target)
+                    self.assertEqual((target / "intro.txt").read_text(encoding="utf-8"), "intro")
+                    if case == "folder":
+                        self.assertEqual((target / "books" / "ch1.txt").read_text(encoding="utf-8"), "one")
+                    else:
+                        self.assertTrue((target / "books").is_file())
+                    self.assertEqual(sorted(p.name for p in target.iterdir()), ["books", "intro.txt"])
+                    self.assertFalse(list(parent.glob(".filelist-*")))
+
     def test_differently_named_wrapper_folder_is_kept(self):
         source = self.root / "bundle.zip"
         with zipfile.ZipFile(source, "w") as archive:
