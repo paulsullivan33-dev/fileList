@@ -124,6 +124,19 @@ class ConfigCheckTests(unittest.TestCase):
             self.assertIn("WARNING: Remote destination timed out: Backup", output)
             self.assertEqual(check_config.main(["--ssh", "--strict"]), 1)
 
+    @unittest.skipUnless(os.name == "posix", "POSIX permission modes")
+    def test_readable_users_file_is_a_warning_with_the_fix(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            users = Path(temporary) / "users.json"
+            users.write_text("[]", encoding="utf-8")
+            users.chmod(0o644)
+            warnings = check_config.check_private_file(users, "users.json")
+            self.assertEqual(len(warnings), 1)
+            self.assertIn("0644", warnings[0])
+            self.assertIn("chmod 600", warnings[0])
+            users.chmod(0o600)
+            self.assertEqual(check_config.check_private_file(users, "users.json"), [])
+
     def test_unreadable_remote_destinations_file_is_still_an_error(self):
         with patch.object(check_config.remote_copy, "load_destinations", side_effect=ValueError("bad JSON")):
             _, errors, warnings = check_config.check_remotes(True)

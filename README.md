@@ -150,9 +150,17 @@ python -c "from werkzeug.security import generate_password_hash; print(generate_
 ```
 
 Paste the generated value into `users.json`; never store a plain-text password there.
+Keep `users.json` private to the account that runs fileList (`chmod 600 users.json`).
+`manage_user.py` sets that mode on every save, and `tools/check_config.py` warns
+when the file is readable by other accounts.
 
 `manage_user.py` now saves a dated backup before replacing existing user settings.
 Backups live beside the original file in `.config-backups/<UTC timestamp>-<id>/`.
+Backups can contain password hashes, so their folders are created 0700 and the
+copies 0600. Restoring over an existing file keeps that file's current mode; a
+restore to a new path uses the mode the original had. Delete backups
+you no longer need. To tighten backups made by older versions, run
+`chmod -R go-rwx .config-backups`.
 Use the same helpers before manually editing other JSON configuration files:
 
 ```bash

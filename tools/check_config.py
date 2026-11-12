@@ -57,6 +57,18 @@ def check_users(path):
     return [f"Users: {len(names)} configured"], errors
 
 
+def check_private_file(path, label):
+    """Warn when a file holding secrets is readable by group or others."""
+    path = Path(path)
+    if os.name != "posix" or not path.exists():
+        return []
+    mode = path.stat().st_mode & 0o777
+    if mode & 0o077:
+        return [f"{label} is readable by other accounts (mode {mode:04o}): {path}. "
+                f"Run: chmod 600 {shlex.quote(str(path))}"]
+    return []
+
+
 def check_writable_location(path, label):
     path = Path(path)
     if path.exists() and not path.is_dir():
@@ -163,6 +175,7 @@ def validate_startup(config=None, users=None, verify_ssh=False, strict=False):
     directory_check = check_directories(config)
     user_check = check_users(users)
     remote_messages, remote_errors, warnings = check_remotes(verify_ssh, strict)
+    warnings = check_private_file(users, "users.json (password hashes)") + warnings
     remote_check = (remote_messages, remote_errors)
     try:
         require_remote_tools = bool(remote_copy.load_destinations())
@@ -197,8 +210,7 @@ def main(argv=None):
         print(f"Configuration check failed with {len(errors)} error(s).")
         return 1
     if warnings:
-        print(f"Configuration check passed with {len(warnings)} warning(s); remote copy/move to "
-              "the destinations above will fail until they are reachable.")
+        print(f"Configuration check passed with {len(warnings)} warning(s).")
     else:
         print("Configuration check passed.")
     return 0
