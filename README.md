@@ -106,10 +106,16 @@ server change:
 
 Add `--ssh` to verify each configured remote destination with the same account
 that runs fileList. It checks passwordless SSH, remote-directory write access,
-and remote `rsync` availability without copying files.
+and remote `rsync` availability without copying files. An unreachable remote,
+or a remote folder that is missing or not writable, is reported as a `WARNING`
+and does not fail the check; add `--strict` to treat it as an error (for
+example, when verifying a new deployment).
 
 `start` and `run.sh` now perform this check automatically, including remote
-availability, before launching either process. Direct Flask and worker launches
+availability, before launching either process. Configuration errors stop the
+launch; a remote destination that is down only prints a warning, so local
+browsing and transfers still start. `run.sh` checks once in the foreground and
+the background launcher does not repeat it. Direct Flask and worker launches
 also validate local configuration and required tools. Fix the numbered entries
 or named settings reported in the error before restarting. Missing configured
 folders are never created automatically: create the intended folder or restore
